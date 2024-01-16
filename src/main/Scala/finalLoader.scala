@@ -43,6 +43,8 @@ object finalLoader {
       val fileContent = spark.sparkContext.textFile(filePath)
       println(s"Processing file: $filePath")
 
+      val desiredTypes = Set("movie", "actor", "director", "country", "actress", "genre")
+
       // 解析文件内容
       val parsedTriplets = fileContent.flatMap { line =>
         Option(line).map(_.trim.dropRight(1).replaceAll("""\^\^<http://www\.w3\.org/2001/XMLSchema#(float|integer)>""", "")).flatMap { trimmedLine =>
@@ -50,10 +52,10 @@ object finalLoader {
           val literalMatches = literalRegex.findAllIn(trimmedLine).toList
 
           (uriMatches, literalMatches) match {
-            case (List(subject, predicate), List(literal)) =>
+            case (List(subject, predicate), List(literal)) if isDesiredType(subject, desiredTypes) =>
               val attributeName = attributeRegex.findFirstMatchIn(predicate).map(_.group(1)).getOrElse("unknown")
               Some((subject, attributeName, literal.replaceAll("\"", ""), "attribute"))
-            case (List(subject, predicate, obj), _) =>
+            case (List(subject, predicate, obj), _) if isDesiredType(subject, desiredTypes) && isDesiredType(obj, desiredTypes) =>
               val attributeName = attributeRegex.findFirstMatchIn(predicate).map(_.group(1)).getOrElse("unknown")
               Some((subject, attributeName, obj, "edge"))
             case _ => None
@@ -170,5 +172,9 @@ object finalLoader {
 
   def extractType(uri: String): String = {
     typeRegex.findFirstMatchIn(uri).map(_.group(1)).getOrElse("unknownType")
+  }
+
+  def isDesiredType(uri: String, desiredTypes: Set[String]): Boolean = {
+    desiredTypes.exists(uri.contains)
   }
 }
