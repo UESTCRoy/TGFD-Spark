@@ -1,14 +1,18 @@
+package tgfdDiscovery.script
+
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
-import org.apache.spark.sql.SparkSession
-import org.apache.spark.graphx._
+import org.apache.log4j.Logger
+import org.apache.spark.graphx.{Edge, Graph, VertexId}
 import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.SparkSession
+import tgfdDiscovery.common.VertexData
+import tgfdDiscovery.script.finalLoader.{createEdges, extractType, extractVertexURI, isDesiredType}
 
 import scala.collection.mutable
 import scala.util.matching.Regex
-import org.apache.log4j.Logger
 
-object finalLoader {
+object CustomIMDBGraph {
   val logger = Logger.getLogger(this.getClass.getName)
 
   // 正则表达式定义
@@ -18,24 +22,27 @@ object finalLoader {
   val attributeRegex: Regex = "/([^/>]+)>$".r
 
   def main(args: Array[String]): Unit = {
-    if (args.length < 2) {
+    if (args.length < 3) {
       logger.error("Usage: IMDBLoader <input_directory> <output_directory>")
       System.exit(1)
     }
 
     val spark = SparkSession
       .builder
-      .appName("RDF Graph Loader")
+      .appName("Generate Custom IMDB Graph")
       .getOrCreate()
 
     spark.sparkContext.setLogLevel("WARN")
 
     val inputDir = args(0)
     val outputDir = args(1)
+    val edgeSize = args(2)
 
     val conf = new Configuration()
     val fs = FileSystem.get(new java.net.URI(inputDir), conf)
     val fileStatusList = fs.listStatus(new Path(inputDir))
+
+    var previousSelectedEdges: Set[Edge[String]] = Set()
 
     fileStatusList.foreach { fileStatus =>
       val filePath = fileStatus.getPath.toString
@@ -65,31 +72,57 @@ object finalLoader {
 
       val vertices: RDD[(VertexId, VertexData)] = createVertices(parsedTriplets)
       val edges: RDD[Edge[String]] = createEdges(parsedTriplets)
-      val graph = Graph(vertices, edges)
+      edges.cache()
 
-      val inDegrees: RDD[(VertexId, Int)] = graph.inDegrees
-      val outDegrees: RDD[(VertexId, Int)] = graph.outDegrees
+      val selectedEdgesRDD = if (previousSelectedEdges.isEmpty) {
+        val graph = Graph(vertices, edges)
+        val inDegrees: RDD[(VertexId, Int)] = graph.inDegrees
+        val outDegrees: RDD[(VertexId, Int)] = graph.outDegrees
 
-      val degrees: RDD[(VertexId, (Int, Int))] = inDegrees.fullOuterJoin(outDegrees)
-        .mapValues {
-          case (inOpt, outOpt) => (inOpt.getOrElse(0), outOpt.getOrElse(0))
-        }
+        val degrees: RDD[(VertexId, (Int, Int))] = inDegrees.fullOuterJoin(outDegrees)
+          .mapValues {
+            case (inOpt, outOpt) => (inOpt.getOrElse(0), outOpt.getOrElse(0))
+          }
 
-      val nonIsolatedVertices: RDD[(VertexId, (VertexData, (Int, Int)))] = graph.vertices
-        .join(degrees)
-        .filter { case (_, (_, (inDeg, outDeg))) => inDeg > 1 || outDeg > 1 }
+        // 筛选出入度和出度都大于一的顶点
+        val validVertices = degrees
+          .filter { case (_, (inDeg, outDeg)) => inDeg > 1 || outDeg > 1 }
+          .map(_._1)
+          .collect()
+          .toSet
 
-      val validVertexIds: Set[VertexId] = nonIsolatedVertices.keys.collect().toSet
-      val validGraph = graph.subgraph(vpred = (id, _) => validVertexIds.contains(id))
+        // 根据有效顶点筛选边
+        val validEdges = graph.edges
+          .filter(e => validVertices.contains(e.srcId) && validVertices.contains(e.dstId))
 
-      println(s"Number of vertices: ${vertices.count()}, Number of edges: ${edges.count()}")
-      println(s"Number of vertices: ${graph.vertices.count()}, Number of edges: ${graph.edges.count()}")
-      println(s"Number of Valid vertices: ${validGraph.vertices.count()}, Number of Valid edges: ${validGraph.edges.count()}")
+        // 从筛选后的边中随机选择
+        val selectedEdgesArray = validEdges.takeSample(withReplacement = false, edgeSize.toInt)
+
+        previousSelectedEdges = selectedEdgesArray.toSet
+        spark.sparkContext.parallelize(selectedEdgesArray)
+      } else {
+        // 后续图：尽量保留之前选定的边
+        selectEdgesToKeep(edges, previousSelectedEdges, edgeSize.toInt)
+      }
+
+      // 创建新图，仅包含选定的边和相关联的顶点
+      val edgeVertices = selectedEdgesRDD
+        .flatMap(e => Iterator(e.srcId, e.dstId))
+        .distinct()
+        .map(id => (id, ()))
+
+      val filteredVertices = vertices
+        .join(edgeVertices)
+        .mapValues(_._1)
+
+      val newGraph = Graph(filteredVertices, selectedEdgesRDD)
+
+      println(s"Number of Valid vertices: ${newGraph.vertices.count()}, Number of Valid edges: ${newGraph.edges.count()}")
 
       val outputFilePath = new Path(outputDir, fileName).toString
 
       // 转换顶点数据为字符串
-      val vertexLines = validGraph.vertices.map { case (_, vertexData) =>
+      val vertexLines = filteredVertices.map { case (_, vertexData: VertexData) =>
         if (vertexData != null && vertexData.vertexType != null && vertexData.uri != null) {
           val uri = s"<http://imdb.org/${vertexData.vertexType}/${vertexData.uri}>"
           vertexData.attributes.toSeq.flatMap { case (attrName, attrValue) =>
@@ -101,10 +134,10 @@ object finalLoader {
       }.filter(_.nonEmpty)
 
       // 创建映射边到它们的源顶点和目标顶点
-      val vertexRdd = validGraph.vertices
+      val vertexRdd = newGraph.vertices
 
       // 将边与其源顶点和目标顶点的数据进行连接
-      val edgesWithVertices = validGraph.edges
+      val edgesWithVertices = newGraph.edges
         .map(e => (e.srcId, e))
         .join(vertexRdd)
         .map { case (_, (edge, srcVertexData)) => (edge.dstId, (edge, srcVertexData)) }
@@ -139,6 +172,18 @@ object finalLoader {
     spark.stop()
   }
 
+  def selectEdgesToKeep(currentEdges: RDD[Edge[String]], previousSelectedEdges: Set[Edge[String]], desiredSize: Int): RDD[Edge[String]] = {
+    val sc = currentEdges.sparkContext
+    val currentSelectedEdges = currentEdges.filter(previousSelectedEdges.contains)
+    val additionalEdgesNeeded = desiredSize - currentSelectedEdges.count().toInt
+    val additionalEdges = if (additionalEdgesNeeded > 0) {
+      currentEdges.subtract(currentSelectedEdges).takeSample(withReplacement = false, additionalEdgesNeeded)
+    } else {
+      Array[Edge[String]]()
+    }
+    sc.parallelize(currentSelectedEdges.collect() ++ additionalEdges)
+  }
+
   def createVertices(parsedTriplets: RDD[(String, String, String, String)]): RDD[(VertexId, VertexData)] = {
     parsedTriplets
       .filter(_._4 == "attribute")
@@ -151,30 +196,8 @@ object finalLoader {
         attrs1 ++= attrs2
       }
       .map { case ((uri, vertexType), attributes) =>
+        //        val id = (uri + vertexType).hashCode.toLong
         (uri.hashCode.toLong, VertexData(uri = uri, vertexType = vertexType, attributes = attributes))
       }
-  }
-
-  def createEdges(parsedTriplets: RDD[(String, String, String, String)]): RDD[Edge[String]] = {
-    parsedTriplets
-      .filter(_._4 == "edge")
-      .map { case (subj, pred, obj, _) =>
-        val subURI = extractVertexURI(subj)
-        val objURI = extractVertexURI(obj)
-        Edge(subURI.hashCode.toLong, objURI.hashCode.toLong, pred)
-      }
-  }
-
-  def extractVertexURI(uri: String): String = {
-    val trimmedUri = uri.drop(1).dropRight(1)
-    trimmedUri.split("/").last
-  }
-
-  def extractType(uri: String): String = {
-    typeRegex.findFirstMatchIn(uri).map(_.group(1)).getOrElse("unknownType")
-  }
-
-  def isDesiredType(uri: String, desiredTypes: Set[String]): Boolean = {
-    desiredTypes.exists(uri.contains)
   }
 }
