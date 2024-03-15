@@ -14,6 +14,7 @@ object PatternGeneration {
     tree.addLevel(initialPatterns)
 
     // 使用广度优先搜索来扩展模式树
+    // TODO: 集群模式下可能得把变量改为广播变量
     var currentLevel = initialPatterns
     var edgeCount = 0
 
