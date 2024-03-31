@@ -1,10 +1,10 @@
-package tgfdDiscovery.patternGeneration
+package tgfdDiscovery.patternGenerator
 
 import tgfdDiscovery.common.{Pattern, PatternTree}
 
 import scala.collection.mutable
 
-object PatternGeneration {
+object PatternGenerator {
 
   def generatePatternTrees(vertexTypes: Array[String], frequentEdges: Array[String], k: Int): PatternTree = {
     val tree = new PatternTree(List())

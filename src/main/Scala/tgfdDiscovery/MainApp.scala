@@ -1,10 +1,11 @@
 package tgfdDiscovery
 
 import org.apache.spark.graphx.Graph
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import tgfdDiscovery.dependencyGeneration.DependencyGenerator
 import tgfdDiscovery.histogram.Histogram
 import tgfdDiscovery.loader.IMDBLoader
-import tgfdDiscovery.patternGeneration.PatternGeneration
+import tgfdDiscovery.patternGenerator.PatternGenerator
 import tgfdDiscovery.patternMatch.PatternMatch
 
 object MainApp {
@@ -30,20 +31,15 @@ object MainApp {
     val vertexTypes = Histogram.countVertexTypes(firstGraph).map(_._1)
     vertexTypes.foreach(println)
 
-    // 统计边类型
-//    System.out.println("Edge Types:")
-//    val edgeTypes = Histogram.countEdgeTypes(firstGraph)
-//    edgeTypes.foreach(println)
-
     // 统计顶点属性
-//    System.out.println("Vertex Attributes:")
-//    val vertexAttributes = Histogram.countVertexAttributes(firstGraph)
-//    vertexAttributes.foreach(println)
+    System.out.println("Vertex Attributes:")
+    val vertexAttributes = Histogram.countVertexAttributes(firstGraph)
+    vertexAttributes.foreach(println)
 
     // 统计属性对应的顶点类型
-    val attributeVertexTypeMap = Histogram.attributeToVertexTypes(firstGraph)
-    attributeVertexTypeMap.collect().foreach { case (attribute, vertexTypes) =>
-      println(s"Attribute: $attribute, Vertex Types: ${vertexTypes.mkString(", ")}")
+    val vertexTypeToAttributes = Histogram.vertexTypeToAttributes(firstGraph)
+    vertexTypeToAttributes.collect().foreach { case (vertexTypes, attribute) =>
+      println(s"Vertex Type: $vertexTypes, Attributes: ${attribute.mkString(", ")}")
     }
 
     // 统计自定义边类型
@@ -53,56 +49,56 @@ object MainApp {
     }
     val edgeTypes = customEdgeTypesCount.map(_._1)
 
-    // 2. 基于统计结果生成新的pattern
-    val patternsTree = PatternGeneration.generatePatternTrees(vertexTypes, edgeTypes, 5)
-
-    // 3. 使用生成的pattern从graph里找matches
-//    PatternMatch.findMatches(spark, firstGraph)
-
-    // TODO: 修改为关于VertexType与attribute的映射关系
-    val attributesMapping = Map(
-      "actor.name" -> "actor",
-      "movie.year_of" -> "movie",
-      "movie.language_of" -> "movie",
-      "movie.name" -> "movie",
-      "actress.name" -> "actress"
+    // 2. 基于统计结果生成新的pattern，这里的k是指最多的边数
+    val vertexToAttribute: Map[String, List[String]] = Map(
+      "actor" -> List("name"),
+      "movie" -> List("year_of", "language_of", "name"),
+      "actress" -> List("name"),
+      "director" -> List("name"),
+      "country" -> List("name"),
+      "genre" -> List("name")
     )
 
-    import scala.collection.mutable
+    val patternsTree = PatternGenerator.generatePatternTrees(vertexTypes, edgeTypes, 5)
+    /*
+        1. 从k = 2开始，遍历每一层的pattern
+        2. 每一层pattern的每一个pattern，进行findMatches
+        3. 在这个pattern里生成dependency，然后对找到的Matches进行withColumn，然后groupByKey
+     */
+    // 先遍历pattern, 在遍历graph, 然后把找到的matches进行groupByKey的lhs
+    patternsTree.levels.drop(2).foreach { level =>
+      level.foreach { pattern =>
+        // Generate dependencies
+        val vertices = pattern.vertices
+        val subMap = vertexToAttribute.filterKeys(vertices.contains)
+        val dependencies = DependencyGenerator.generateCombinations(subMap)
 
-    // 初始化用于存储所有可能依赖关系的集合
-    val dependencies = mutable.Set.empty[(Set[String], String)]
+        val frames: Seq[DataFrame] = graphs.map(graph => {
+          // Find matches for each graph and collect the resulting DataFrames
+          PatternMatch.findMatches(spark, graph, pattern.edges)
+        })
+//        val combinedFrame = frames.reduce(_ union _)
 
-    // 给定的顶点类型集合
-//    val patternVertexTypes = Set("actor", "movie", "actress", "director")
-    val patternVertexTypes = Set("actor", "movie", "actress")
+        dependencies.foreach { dependency =>
+          val modifiedFrames = graphs.map { graph =>
+            val matches = PatternMatch.findMatches(spark, graph, pattern.edges)
+            val modifiedFrame = PatternMatch.applyDependencyAttributes(matches, Seq(dependency))
+            modifiedFrame.show()
+            modifiedFrame
+          }
 
-    // 计算左侧属性的数量
-    val leftSideCount = patternVertexTypes.size - 1
-
-    // 生成所有属性的组合，确保组合中的属性来自不同的顶点类型
-    val allCombinations = attributesMapping.keys.toSet.subsets(leftSideCount).filter { subset =>
-      subset.map(attributesMapping).size == leftSideCount
-    }
-
-    // 对于每个可能的左侧组合，找到可能的右侧属性
-    allCombinations.foreach { combination =>
-      val leftTypes = combination.map(attributesMapping)
-      val possibleRightTypes = patternVertexTypes.diff(leftTypes)
-
-      possibleRightTypes.foreach { rightType =>
-        attributesMapping.filter { case (attr, vType) => vType == rightType }.keys.foreach { rightAttr =>
-          dependencies.add((combination, rightAttr))
+          // 如果需要，可以在这里处理modifiedFrames（例如，合并或进一步分析）
+          // 示例：合并所有修改后的DataFrame为一个DataFrame
+          val combinedFrame = if (modifiedFrames.nonEmpty) modifiedFrames.reduce(_ union _) else spark.emptyDataFrame
+          // 进行更多操作，比如展示合并后的DataFrame
+          combinedFrame.show()
         }
+
       }
     }
 
-    // 打印生成的依赖关系
-    dependencies.foreach { case (inputs, result) =>
-      println(s"(${inputs.mkString(", ")}) → $result")
-    }
-
-
+    // 3. 使用生成的pattern从graph里找matches
+    //    PatternMatch.findMatches(spark, firstGraph)
 
     // 结束Spark会话
     spark.stop()

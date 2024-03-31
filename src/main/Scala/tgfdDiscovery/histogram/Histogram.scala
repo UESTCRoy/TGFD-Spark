@@ -21,14 +21,14 @@ object Histogram {
     }.reduceByKey(_ + _).top(10)(Ordering.by(_._2))
   }
 
-  def attributeToVertexTypes(graph: Graph[VertexData, String]): RDD[(String, Set[String])] = {
+  def vertexTypeToAttributes(graph: Graph[VertexData, String]): RDD[(String, Set[String])] = {
     graph.vertices.flatMap { case (_, vertexData) =>
-      vertexData.attributes.keys.map(attribute => (attribute, vertexData.vertexType))
+      vertexData.attributes.keys.map(attribute => (vertexData.vertexType, attribute))
     }
-      .distinct() // 去除重复项，确保每个类型只被计数一次
+      .distinct()
       .aggregateByKey(Set.empty[String])(
-        (set, vertexType) => set + vertexType, // 添加顶点类型到集合中
-        (set1, set2) => set1 ++ set2 // 合并集合
+        (set, attribute) => set + attribute,
+        (set1, set2) => set1 ++ set2
       )
   }
 
