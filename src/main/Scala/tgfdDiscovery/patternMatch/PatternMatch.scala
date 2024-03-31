@@ -67,14 +67,19 @@ object PatternMatch {
   }
 
   def applyDependencyAttributes(df: DataFrame, dependencies: Seq[(Set[String], String)]): DataFrame = {
-    dependencies.foldLeft(df) { case (currentDf, (dependencyLhs, dependencyRhs)) =>
-      val updatedDf = dependencyLhs.foldLeft(currentDf) { (df, lhs) =>
+    var newColumns: Seq[String] = Seq()
+
+    val updatedDf = dependencies.foldLeft(df) { case (currentDf, (dependencyLhs, dependencyRhs)) =>
+      val intermediateDf = dependencyLhs.foldLeft(currentDf) { (df, lhs) =>
         val lhsParts = lhs.split("\\.")
         if (lhsParts.length == 2) {
           val vertexLabel = lhsParts(0)
           val attributeName = lhsParts(1)
           attributeExtractors.get(attributeName) match {
-            case Some(udfFunction) => df.withColumn(s"${vertexLabel}_${attributeName}", udfFunction(col(s"$vertexLabel.attributes")))
+            case Some(udfFunction) =>
+              val newColName = s"${vertexLabel}_${attributeName}"
+              newColumns = newColumns :+ newColName
+              df.withColumn(newColName, udfFunction(col(s"$vertexLabel.attributes")))
             case None => df
           }
         } else df
@@ -85,10 +90,15 @@ object PatternMatch {
         val vertexLabel = rhsParts(0)
         val attributeName = rhsParts(1)
         attributeExtractors.get(attributeName) match {
-          case Some(udfFunction) => updatedDf.withColumn(s"${vertexLabel}_${attributeName}", udfFunction(col(s"$vertexLabel.attributes")))
-          case None => updatedDf
+          case Some(udfFunction) =>
+            val newColName = s"${vertexLabel}_${attributeName}"
+            newColumns = newColumns :+ newColName
+            intermediateDf.withColumn(newColName, udfFunction(col(s"$vertexLabel.attributes")))
+          case None => intermediateDf
         }
-      } else updatedDf
+      } else intermediateDf
     }
+
+    updatedDf.select(newColumns.head, newColumns.tail: _*)
   }
 }

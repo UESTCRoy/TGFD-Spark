@@ -1,6 +1,8 @@
 package tgfdDiscovery
 
 import org.apache.spark.graphx.Graph
+import org.apache.spark.sql.expressions.UserDefinedFunction
+import org.apache.spark.sql.functions.{array, col, collect_list, lit, udf}
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import tgfdDiscovery.dependencyGeneration.DependencyGenerator
 import tgfdDiscovery.histogram.Histogram
@@ -10,16 +12,13 @@ import tgfdDiscovery.patternMatch.PatternMatch
 
 object MainApp {
   def main(args: Array[String]): Unit = {
-    // 初始化SparkSession
     val spark = SparkSession.builder()
       .appName("TGFD Discovery")
-      .master("local[*]") // 或者根据需要配置为其他模式
+      .master("local[*]")
       .getOrCreate()
 
-    // 设置日志级别
     spark.sparkContext.setLogLevel("WARN")
 
-    // 读取IMDB数据
     val hdfsPath = "hdfs://data/imdb/completeGraph/new_imdb/"
     val localPath = "/Users/roy/Desktop/TGFD/datasets/imdb/300k_imdb/"
     val graphs = IMDBLoader.loadGraphSnapshots(spark, localPath, "170909", "171009")
@@ -60,47 +59,49 @@ object MainApp {
     )
 
     val patternsTree = PatternGenerator.generatePatternTrees(vertexTypes, edgeTypes, 5)
-    /*
-        1. 从k = 2开始，遍历每一层的pattern
-        2. 每一层pattern的每一个pattern，进行findMatches
-        3. 在这个pattern里生成dependency，然后对找到的Matches进行withColumn，然后groupByKey
-     */
-    // 先遍历pattern, 在遍历graph, 然后把找到的matches进行groupByKey的lhs
+
+    val mergeFlagsUDF: UserDefinedFunction = udf((arrays: Seq[Seq[Int]]) => {
+      arrays.transpose.map(_.reduce((a, b) => a | b))
+    })
+
     patternsTree.levels.drop(2).foreach { level =>
       level.foreach { pattern =>
-        // Generate dependencies
         val vertices = pattern.vertices
         val subMap = vertexToAttribute.filterKeys(vertices.contains)
         val dependencies = DependencyGenerator.generateCombinations(subMap)
 
-        val frames: Seq[DataFrame] = graphs.map(graph => {
-          // Find matches for each graph and collect the resulting DataFrames
-          PatternMatch.findMatches(spark, graph, pattern.edges)
-        })
-//        val combinedFrame = frames.reduce(_ union _)
-
-        dependencies.foreach { dependency =>
-          val modifiedFrames = graphs.map { graph =>
-            val matches = PatternMatch.findMatches(spark, graph, pattern.edges)
-            val modifiedFrame = PatternMatch.applyDependencyAttributes(matches, Seq(dependency))
-            modifiedFrame.show()
-            modifiedFrame
-          }
-
-          // 如果需要，可以在这里处理modifiedFrames（例如，合并或进一步分析）
-          // 示例：合并所有修改后的DataFrame为一个DataFrame
-          val combinedFrame = if (modifiedFrames.nonEmpty) modifiedFrames.reduce(_ union _) else spark.emptyDataFrame
-          // 进行更多操作，比如展示合并后的DataFrame
-          combinedFrame.show()
+        val frames: Seq[(DataFrame, Int)] = graphs.zipWithIndex.map { case (graph, index) =>
+          val frame = PatternMatch.findMatches(spark, graph, pattern.edges)
+          (frame, index)
         }
 
+        dependencies.foreach { dependency =>
+          val modifiedFrames = frames.map { case (frame, graphIndex) =>
+            val modifiedFrame = PatternMatch.applyDependencyAttributes(frame, Seq(dependency))
+
+            val flagArray = Array.fill(graphs.length)(0)
+            flagArray(graphIndex) = 1
+
+            modifiedFrame.withColumn("presence_flags", array(flagArray.map(lit): _*))
+          }
+
+          val combinedDf = modifiedFrames.reduce(_ unionByName _)
+
+          val groupingColumns = combinedDf.columns.filterNot(_ == "presence_flags").map(col)
+
+          val aggregatedDf = combinedDf
+            .groupBy(groupingColumns: _*)
+            .agg(
+              collect_list("presence_flags").as("collected_flags")
+            )
+            .withColumn("presence_flags", mergeFlagsUDF(col("collected_flags")))
+            .drop("collected_flags")
+
+          aggregatedDf.show(false)
+        }
       }
     }
 
-    // 3. 使用生成的pattern从graph里找matches
-    //    PatternMatch.findMatches(spark, firstGraph)
-
-    // 结束Spark会话
     spark.stop()
   }
 
