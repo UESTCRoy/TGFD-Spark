@@ -3,7 +3,8 @@ package tgfdDiscovery.patternMatch
 import org.apache.spark.graphx._
 import org.apache.spark.sql
 import org.apache.spark.sql.{DataFrame, SparkSession}
-import org.apache.spark.sql.functions.{col, lit, udf}
+import org.apache.spark.sql.functions.{array, col, collect_list, lit, udf}
+import org.apache.spark.sql.types.StringType
 import org.graphframes.GraphFrame
 import tgfdDiscovery.common.VertexData
 
@@ -48,6 +49,36 @@ object PatternMatch {
 //    println(s"Found $matchesCount matches.")
 
     filteredMatches
+  }
+
+  def processPatternAndDependency(spark: SparkSession, graphs: Seq[Graph[VertexData, String]], edges: Set[(String, String, String)], dependency: (Set[String], String)): DataFrame = {
+    import spark.implicits._
+
+    val mergeFlagsUDF = udf((arrays: Seq[Seq[Int]]) => arrays.transpose.map(_.reduce((a, b) => a | b)))
+
+    val frames = graphs.zipWithIndex.map { case (graph, index) =>
+      val frame = findMatches(spark, graph, edges)
+      val modifiedFrame = applyDependencyAttributes(frame, Seq(dependency))
+      val filteredFrame = filterDataFrame(modifiedFrame)
+      val flagArray = Array.fill(graphs.length)(0)
+      flagArray(index) = 1
+      filteredFrame.withColumn("presence_flags", array(flagArray.map(lit): _*))
+    }
+
+    val combinedDf = frames.reduce(_ unionByName _)
+    val groupingColumns = combinedDf.columns.filterNot(_ == "presence_flags").map(col)
+
+    combinedDf.groupBy(groupingColumns: _*)
+      .agg(collect_list("presence_flags").as("collected_flags"))
+      .withColumn("presence_flags", mergeFlagsUDF(col("collected_flags")))
+      .drop("collected_flags")
+  }
+
+  def filterDataFrame(df: DataFrame): DataFrame = {
+    val stringFields = df.schema.fields.filter(_.dataType == StringType).map(_.name)
+    stringFields.foldLeft(df) { (currentDf, fieldName) =>
+      currentDf.filter(!(col(fieldName).equalTo("????") || col(fieldName).isNull || col(fieldName).equalTo("")))
+    }
   }
 
   def generateQueryAndFilters(edges: Seq[(String, String, String)]): (String, Seq[org.apache.spark.sql.Column]) = {

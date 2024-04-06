@@ -1,4 +1,4 @@
-package tgfdDiscovery.dependencyGeneration
+package tgfdDiscovery.dependencyGenerator
 
 import scala.collection.mutable.ListBuffer
 
