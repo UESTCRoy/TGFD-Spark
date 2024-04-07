@@ -43,29 +43,26 @@ object PatternMatch {
     val matches = g.find(queryPattern)
 
     val filteredMatches = filters.foldLeft(matches) { (df, condition) => df.filter(condition) }
-//    filteredMatches.show(false)
+    //    filteredMatches.show(false)
 
-//    val matchesCount = filteredMatches.count()
-//    println(s"Found $matchesCount matches.")
+    //    val matchesCount = filteredMatches.count()
+    //    println(s"Found $matchesCount matches.")
 
     filteredMatches
   }
 
-  def processPatternAndDependency(spark: SparkSession, graphs: Seq[Graph[VertexData, String]], edges: Set[(String, String, String)], dependency: (Set[String], String)): DataFrame = {
-    import spark.implicits._
-
+  def processFramesAndDependency(framesWithIndex: Seq[(DataFrame, Int)], dependency: (Set[String], String)): DataFrame = {
     val mergeFlagsUDF = udf((arrays: Seq[Seq[Int]]) => arrays.transpose.map(_.reduce((a, b) => a | b)))
 
-    val frames = graphs.zipWithIndex.map { case (graph, index) =>
-      val frame = findMatches(spark, graph, edges)
-      val modifiedFrame = applyDependencyAttributes(frame, Seq(dependency))
-      val filteredFrame = filterDataFrame(modifiedFrame)
-      val flagArray = Array.fill(graphs.length)(0)
+    val modifiedFrames = framesWithIndex.map { case (frame, index) =>
+      val modifiedFrame = PatternMatch.applyDependencyAttributes(frame, Seq(dependency))
+      val filteredFrame = PatternMatch.filterDataFrame(modifiedFrame)
+      val flagArray = Array.fill(framesWithIndex.length)(0)
       flagArray(index) = 1
       filteredFrame.withColumn("presence_flags", array(flagArray.map(lit): _*))
     }
 
-    val combinedDf = frames.reduce(_ unionByName _)
+    val combinedDf = modifiedFrames.reduce(_ unionByName _)
     val groupingColumns = combinedDf.columns.filterNot(_ == "presence_flags").map(col)
 
     combinedDf.groupBy(groupingColumns: _*)

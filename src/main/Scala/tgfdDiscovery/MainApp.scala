@@ -37,10 +37,14 @@ object MainApp {
 
     patternsTree.levels.drop(2).foreach { level =>
       level.foreach { pattern =>
+        val framesWithIndex = graphs.zipWithIndex.map { case (graph, index) =>
+          val frame = PatternMatch.findMatches(spark, graph, pattern.edges)
+          (frame, index)
+        }
         val dependencies = DependencyGenerator.generateCombinations(vertexToAttribute.filterKeys(pattern.vertices.contains))
 
         dependencies.foreach { dependency =>
-          val combinedDf = PatternMatch.processPatternAndDependency(spark, graphs, pattern.edges, dependency)
+          val combinedDf = PatternMatch.processFramesAndDependency(framesWithIndex, dependency)
           combinedDf.show(false)
           // TODO: Deal with Negative TGFD by groupBy LHS. Transform Dataframe into DataSets
           // TGFD: Pattern, Dependency, Delta
