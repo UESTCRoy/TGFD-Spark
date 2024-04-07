@@ -41,19 +41,15 @@ object MainApp {
           val frame = PatternMatch.findMatches(spark, graph, pattern.edges)
           (frame, index)
         }
-        val dependencies = DependencyGenerator.generateCombinations(vertexToAttribute.filterKeys(pattern.vertices.contains))
+        val dependencies = DependencyGenerator.generateCandidateDependency(pattern.vertices, vertexToAttribute)
 
-        dependencies.foreach { dependency =>
+        dependencies.foreach {dependency => {
           val combinedDf = PatternMatch.processFramesAndDependency(framesWithIndex, dependency)
           combinedDf.show(false)
           // TODO: Deal with Negative TGFD by groupBy LHS. Transform Dataframe into DataSets
           // TGFD: Pattern, Dependency, Delta
 
-          val lhs = dependency._1
-          val rhs = dependency._2
-
-
-        }
+        }}
       }
     }
 

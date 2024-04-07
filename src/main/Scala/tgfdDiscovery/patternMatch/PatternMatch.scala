@@ -51,11 +51,11 @@ object PatternMatch {
     filteredMatches
   }
 
-  def processFramesAndDependency(framesWithIndex: Seq[(DataFrame, Int)], dependency: (Set[String], String)): DataFrame = {
+  def processFramesAndDependency(framesWithIndex: Seq[(DataFrame, Int)], dependency: Set[String]): DataFrame = {
     val mergeFlagsUDF = udf((arrays: Seq[Seq[Int]]) => arrays.transpose.map(_.reduce((a, b) => a | b)))
 
     val modifiedFrames = framesWithIndex.map { case (frame, index) =>
-      val modifiedFrame = PatternMatch.applyDependencyAttributes(frame, Seq(dependency))
+      val modifiedFrame = PatternMatch.applyDependencyAttributes(frame, dependency)
       val filteredFrame = PatternMatch.filterDataFrame(modifiedFrame)
       val flagArray = Array.fill(framesWithIndex.length)(0)
       flagArray(index) = 1
@@ -71,14 +71,14 @@ object PatternMatch {
       .drop("collected_flags")
   }
 
-  def filterDataFrame(df: DataFrame): DataFrame = {
+  private def filterDataFrame(df: DataFrame): DataFrame = {
     val stringFields = df.schema.fields.filter(_.dataType == StringType).map(_.name)
     stringFields.foldLeft(df) { (currentDf, fieldName) =>
       currentDf.filter(!(col(fieldName).equalTo("????") || col(fieldName).isNull || col(fieldName).equalTo("")))
     }
   }
 
-  def generateQueryAndFilters(edges: Seq[(String, String, String)]): (String, Seq[org.apache.spark.sql.Column]) = {
+  private def generateQueryAndFilters(edges: Seq[(String, String, String)]): (String, Seq[org.apache.spark.sql.Column]) = {
     val pattern = edges.zipWithIndex.map { case ((src, rel, dst), index) =>
       s"($src)-[e$index]->($dst)"
     }.mkString("; ")
@@ -94,37 +94,22 @@ object PatternMatch {
     (pattern, filters)
   }
 
-  def applyDependencyAttributes(df: DataFrame, dependencies: Seq[(Set[String], String)]): DataFrame = {
+  private def applyDependencyAttributes(df: DataFrame, dependencies: Set[String]): DataFrame = {
     var newColumns: Seq[String] = Seq()
 
-    val updatedDf = dependencies.foldLeft(df) { case (currentDf, (dependencyLhs, dependencyRhs)) =>
-      val intermediateDf = dependencyLhs.foldLeft(currentDf) { (df, lhs) =>
-        val lhsParts = lhs.split("\\.")
-        if (lhsParts.length == 2) {
-          val vertexLabel = lhsParts(0)
-          val attributeName = lhsParts(1)
-          attributeExtractors.get(attributeName) match {
-            case Some(udfFunction) =>
-              val newColName = s"${vertexLabel}_${attributeName}"
-              newColumns = newColumns :+ newColName
-              df.withColumn(newColName, udfFunction(col(s"$vertexLabel.attributes")))
-            case None => df
-          }
-        } else df
-      }
-
-      val rhsParts = dependencyRhs.split("\\.")
-      if (rhsParts.length == 2) {
-        val vertexLabel = rhsParts(0)
-        val attributeName = rhsParts(1)
+    val updatedDf = dependencies.foldLeft(df) { (currentDf, dependency) =>
+      val parts = dependency.split("\\.")
+      if (parts.length == 2) {
+        val vertexLabel = parts(0)
+        val attributeName = parts(1)
         attributeExtractors.get(attributeName) match {
           case Some(udfFunction) =>
-            val newColName = s"${vertexLabel}_${attributeName}"
+            val newColName = s"${vertexLabel}_$attributeName"
             newColumns = newColumns :+ newColName
-            intermediateDf.withColumn(newColName, udfFunction(col(s"$vertexLabel.attributes")))
-          case None => intermediateDf
+            currentDf.withColumn(newColName, udfFunction(col(s"$vertexLabel.attributes")))
+          case None => currentDf
         }
-      } else intermediateDf
+      } else currentDf
     }
 
     updatedDf.select(newColumns.head, newColumns.tail: _*)
