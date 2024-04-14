@@ -98,13 +98,13 @@ object PatternMatch {
     var newColumns: Seq[String] = Seq()
 
     val updatedDf = dependencies.foldLeft(df) { (currentDf, dependency) =>
-      val parts = dependency.split("\\.")
+      val parts = dependency.split("-")
       if (parts.length == 2) {
         val vertexLabel = parts(0)
         val attributeName = parts(1)
         attributeExtractors.get(attributeName) match {
           case Some(udfFunction) =>
-            val newColName = s"${vertexLabel}_$attributeName"
+            val newColName = s"${vertexLabel}-$attributeName"
             newColumns = newColumns :+ newColName
             currentDf.withColumn(newColName, udfFunction(col(s"$vertexLabel.attributes")))
           case None => currentDf

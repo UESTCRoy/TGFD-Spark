@@ -1,12 +1,12 @@
 package tgfdDiscovery
 
-import org.apache.spark.graphx.Graph
 import org.apache.spark.sql.SparkSession
 import tgfdDiscovery.dependencyGenerator.DependencyGenerator
 import tgfdDiscovery.histogram.Histogram
 import tgfdDiscovery.loader.IMDBLoader
 import tgfdDiscovery.patternGenerator.PatternGenerator
 import tgfdDiscovery.patternMatch.PatternMatch
+import tgfdDiscovery.tgfdGenerator.TGFDGenerator
 
 object MainApp {
   def main(args: Array[String]): Unit = {
@@ -43,13 +43,14 @@ object MainApp {
         }
         val dependencies = DependencyGenerator.generateCandidateDependency(pattern.vertices, vertexToAttribute)
 
-        dependencies.foreach {dependency => {
+        dependencies.foreach { dependency =>
           val combinedDf = PatternMatch.processFramesAndDependency(framesWithIndex, dependency)
-          combinedDf.show(false)
-          // TODO: Deal with Negative TGFD by groupBy LHS. Transform Dataframe into DataSets
-          // TGFD: Pattern, Dependency, Delta
+          val dfCount = combinedDf.count()
 
-        }}
+          TGFDGenerator.processTGFDs(combinedDf, pattern, dependency, dfCount).foreach(println)
+
+        }
+
       }
     }
 
