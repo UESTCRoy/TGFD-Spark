@@ -6,7 +6,6 @@ object DeltaGenerator {
       case (count, index) if count > 0 => index
     }
 
-    // If there are fewer than two indices where the count is greater than 0, return None
     if (occurIndices.length < 2) {
       None
     } else {

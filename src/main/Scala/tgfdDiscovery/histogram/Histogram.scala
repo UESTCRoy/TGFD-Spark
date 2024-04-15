@@ -58,6 +58,7 @@ object Histogram {
 
     val filteredEdgeTypeCounts = uniqueEdgeTypeCounts.filter(_._2 >= 1000)
 
+    // TODO: Set Frequent Edges Here
     filteredEdgeTypeCounts.takeOrdered(10)(Ordering[Int].reverse.on(_._2))
   }
 

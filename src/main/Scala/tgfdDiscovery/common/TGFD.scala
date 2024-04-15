@@ -1,3 +1,3 @@
 package tgfdDiscovery.common
 
-case class TGFD(pattern: Pattern, lhs: Set[String], rhs: String, delta: (Int, Int))
+case class TGFD(pattern: Pattern, dependency: Dependency, delta: (Int, Int))

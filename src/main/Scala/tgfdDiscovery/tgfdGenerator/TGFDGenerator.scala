@@ -2,10 +2,9 @@ package tgfdDiscovery.tgfdGenerator
 
 import org.apache.spark.sql.functions.{col, collect_list, expr, first, udf}
 import org.apache.spark.sql.DataFrame
-import tgfdDiscovery.common.Pattern
+import tgfdDiscovery.common.{Pattern, Dependency, TGFD}
 import tgfdDiscovery.dependencyGenerator.DependencyGenerator
 import tgfdDiscovery.supportCompute.SupportCompute
-import tgfdDiscovery.common.TGFD
 import tgfdDiscovery.deltaGenerator.DeltaGenerator
 
 import scala.collection.mutable.ListBuffer
@@ -13,7 +12,7 @@ import scala.collection.mutable.ListBuffer
 object TGFDGenerator {
   val flattenListUDF = udf((lists: Seq[Seq[Int]]) => lists.flatten)
 
-  def processTGFDs(combinedDf: DataFrame, pattern: Pattern, dependencies: Set[String], dfCount: Long): List[TGFD] = {
+  def processTGFDs(combinedDf: DataFrame, pattern: Pattern, dependencies: Set[String], dfCount: Long, tgfdTheta: Double): List[TGFD] = {
     val results = ListBuffer[TGFD]()
     val lhsRhsCombinations = DependencyGenerator.generateLhsRhsCombinations(dependencies)
 
@@ -36,9 +35,14 @@ object TGFDGenerator {
           case Some((minDelta, maxDelta)) =>
             val delta = (minDelta, maxDelta)
             val support = SupportCompute.calculateTGFDSupport(flags.toList, dfCount, flags.size)
-            val lhsValues = lhs.map(l => row.getAs[String](l))
-            val rhsValue = row.getAs[String](rhs)
-            Some(TGFD(pattern, lhsValues.toSet, rhsValue, delta))
+            if (support >= tgfdTheta) {
+              val lhsValues = lhs.map(l => row.getAs[String](l)).toSet
+              val rhsValue = row.getAs[String](rhs)
+              val dependency = Dependency(lhs, rhs, lhsValues, rhsValue)
+              Some(TGFD(pattern, dependency, delta))
+            } else {
+              None
+            }
           case None => None
         }
       }
