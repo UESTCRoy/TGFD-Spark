@@ -29,13 +29,22 @@ object graphPartitioner {
 
     val spark = SparkSession
       .builder
-      .appName("RDF Graph Loader")
+      .appName("IMDB Graph Partitioner")
       .getOrCreate()
 
     spark.sparkContext.setLogLevel("WARN")
 
     val inputDir = args(0)
     val outputDir = args(1)
+
+    //    val spark = SparkSession
+    //      .builder
+    //      .appName("RDF Graph Loader")
+    //      .master("local[*]")
+    //      .getOrCreate()
+    //
+    //    val inputDir = "/Users/roy/Desktop/TGFD/datasets/imdb/1m_imdb_old/imdb-180909.nt"
+    //    val outputDir = ""
 
     val conf = new Configuration()
     val fs = FileSystem.get(new java.net.URI(inputDir), conf)
@@ -87,6 +96,7 @@ object graphPartitioner {
 
       // 初始化分配状态
       val initialVertexTypeCounts = graph.vertices
+        .filter { case (_, vertexData) => vertexData != null && vertexData.vertexType != null }
         .map { case (_, vertexData) => vertexData.vertexType }
         .distinct()
         .collect()
@@ -139,7 +149,17 @@ object graphPartitioner {
             val uri = s"<http://imdb.org/${vertexData.vertexType}/${vertexData.uri}>"
             vertexData.attributes.toSeq.flatMap { case (attrName, attrValue) =>
               if (attrName != null && attrValue != null) {
-                Some(s"""$uri <http://xmlns.com/foaf/0.1/$attrName> "$attrValue" .""")
+                var mutableAttrValue = attrValue
+
+                if (mutableAttrValue.endsWith("\\") || mutableAttrValue.endsWith(" \\")) {
+                  // Regular expression to remove a backslash or space followed by a backslash at the end of the string
+                  val cleanedLiteral = mutableAttrValue
+                    .replaceAll(" \\\\$", "")  // Removes ' \' if it's at the end of the string
+                    .replaceAll("\\\\$", "")   // Removes '\' if it's at the end of the string
+                  mutableAttrValue = cleanedLiteral
+                }
+
+                Some(s"""$uri <http://xmlns.com/foaf/0.1/$attrName> "$mutableAttrValue" .""")
               } else None
             }.mkString("\n")
           } else ""

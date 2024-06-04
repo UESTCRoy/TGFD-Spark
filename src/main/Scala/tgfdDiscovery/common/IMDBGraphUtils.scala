@@ -11,6 +11,7 @@ object IMDBGraphUtils {
   val literalRegex: Regex = "\"[^\"]+\"".r
   val typeRegex: Regex = ".*/([^/]+)/[^/]*>$".r
   val attributeRegex: Regex = "/([^/>]+)>$".r
+  val imdbUriRegex: Regex = "<http://imdb.org/([^/]+)/([^>]+)>".r
 
   def isDesiredType(uri: String, desiredTypes: Set[String]): Boolean = {
     desiredTypes.exists(uri.contains)
@@ -46,11 +47,16 @@ object IMDBGraphUtils {
   }
 
   def extractIMDBVertexURI(uri: String): String = {
-    val trimmedUri = uri.drop(1).dropRight(1)
-    trimmedUri.split("/").last
+    uri match {
+      case imdbUriRegex(_, resourceIdentifier) => resourceIdentifier
+      case _ => "unknownResource"
+    }
   }
 
   def extractIMDBType(uri: String): String = {
-    typeRegex.findFirstMatchIn(uri).map(_.group(1)).getOrElse("unknownType")
+    uri match {
+      case imdbUriRegex(resourceType, _) => resourceType
+      case _ => "unknownType"
+    }
   }
 }

@@ -9,7 +9,6 @@ import org.apache.spark.sql.SparkSession
 import tgfdDiscovery.common.IMDBGraphUtils.{createIMDBEdges, createIMDBVertices, extractIMDBType, extractIMDBVertexURI, isDesiredType}
 import tgfdDiscovery.common.VertexData
 
-import scala.collection.mutable
 import scala.util.matching.Regex
 
 object CustomIMDBGraph {
@@ -22,27 +21,37 @@ object CustomIMDBGraph {
   val attributeRegex: Regex = "/([^/>]+)>$".r
 
   def main(args: Array[String]): Unit = {
-    if (args.length < 3) {
-      logger.error("Usage: IMDBLoader <input_directory> <output_directory>")
-      System.exit(1)
-    }
+        if (args.length < 3) {
+          logger.error("Usage: IMDBLoader <input_directory> <output_directory>")
+          System.exit(1)
+        }
 
-    val spark = SparkSession
-      .builder
-      .appName("Generate Custom IMDB Graph")
-      .getOrCreate()
+        val spark = SparkSession
+          .builder
+          .appName("Generate Custom IMDB Graph")
+          .getOrCreate()
 
-    spark.sparkContext.setLogLevel("WARN")
+        spark.sparkContext.setLogLevel("WARN")
 
-    val inputDir = args(0)
-    val outputDir = args(1)
-    val edgeSize = args(2)
+        val inputDir = args(0)
+        val outputDir = args(1)
+        val edgeSize = args(2)
+
+//    val spark = SparkSession
+//      .builder
+//      .appName("RDF Graph Loader")
+//      .master("local[*]")
+//      .getOrCreate()
+//
+//    val inputDir = "/Users/roy/Desktop/TGFD/datasets/imdb/1m_imdb_old/imdb-170909.nt"
+//    val outputDir = "/Users/roy/Desktop/TGFD/test"
+//    val edgeSize = 10000000
 
     val conf = new Configuration()
     val fs = FileSystem.get(new java.net.URI(inputDir), conf)
     val fileStatusList = fs.listStatus(new Path(inputDir))
 
-    var previousSelectedEdges: Set[Edge[String]] = Set()
+    var previousSelectedEdges: RDD[Edge[String]] = spark.sparkContext.emptyRDD[Edge[String]]
 
     fileStatusList.foreach { fileStatus =>
       val filePath = fileStatus.getPath.toString
@@ -96,14 +105,15 @@ object CustomIMDBGraph {
           .filter(e => validVertices.contains(e.srcId) && validVertices.contains(e.dstId))
 
         // 从筛选后的边中随机选择
-        val selectedEdgesArray = validEdges.takeSample(withReplacement = false, edgeSize.toInt)
+        val initialSelectedEdgesArray = validEdges.takeSample(withReplacement = false, edgeSize.toInt)
 
-        previousSelectedEdges = selectedEdgesArray.toSet
-        spark.sparkContext.parallelize(selectedEdgesArray)
+        spark.sparkContext.parallelize(initialSelectedEdgesArray)
       } else {
         // 后续图：尽量保留之前选定的边
         selectEdgesToKeep(edges, previousSelectedEdges, edgeSize.toInt)
       }
+      // Update previousSelectedEdges with the latest selected edges
+      previousSelectedEdges = selectedEdgesRDD
 
       // 创建新图，仅包含选定的边和相关联的顶点
       val edgeVertices = selectedEdgesRDD
@@ -121,13 +131,22 @@ object CustomIMDBGraph {
 
       val outputFilePath = new Path(outputDir, fileName).toString
 
-      // 转换顶点数据为字符串
       val vertexLines = filteredVertices.map { case (_, vertexData: VertexData) =>
         if (vertexData != null && vertexData.vertexType != null && vertexData.uri != null) {
           val uri = s"<http://imdb.org/${vertexData.vertexType}/${vertexData.uri}>"
           vertexData.attributes.toSeq.flatMap { case (attrName, attrValue) =>
             if (attrName != null && attrValue != null) {
-              Some(s"""$uri <http://xmlns.com/foaf/0.1/$attrName> "$attrValue" .""")
+              var mutableAttrValue = attrValue
+
+              if (mutableAttrValue.endsWith("\\") || mutableAttrValue.endsWith(" \\")) {
+                // Regular expression to remove a backslash or space followed by a backslash at the end of the string
+                val cleanedLiteral = mutableAttrValue
+                  .replaceAll(" \\\\$", "")  // Removes ' \' if it's at the end of the string
+                  .replaceAll("\\\\$", "")   // Removes '\' if it's at the end of the string
+                mutableAttrValue = cleanedLiteral
+              }
+
+              Some(s"""$uri <http://xmlns.com/foaf/0.1/$attrName> "$mutableAttrValue" .""")
             } else None
           }.mkString("\n")
         } else ""
@@ -172,9 +191,9 @@ object CustomIMDBGraph {
     spark.stop()
   }
 
-  def selectEdgesToKeep(currentEdges: RDD[Edge[String]], previousSelectedEdges: Set[Edge[String]], desiredSize: Int): RDD[Edge[String]] = {
+  def selectEdgesToKeep(currentEdges: RDD[Edge[String]], previousSelectedEdges: RDD[Edge[String]], desiredSize: Int): RDD[Edge[String]] = {
     val sc = currentEdges.sparkContext
-    val currentSelectedEdges = currentEdges.filter(previousSelectedEdges.contains)
+    val currentSelectedEdges = currentEdges.intersection(previousSelectedEdges)
     val additionalEdgesNeeded = desiredSize - currentSelectedEdges.count().toInt
     val additionalEdges = if (additionalEdgesNeeded > 0) {
       currentEdges.subtract(currentSelectedEdges).takeSample(withReplacement = false, additionalEdgesNeeded)
