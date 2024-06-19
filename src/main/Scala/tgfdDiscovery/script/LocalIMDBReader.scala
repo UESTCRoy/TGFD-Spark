@@ -29,7 +29,7 @@ object LocalIMDBReader {
       .master("local[*]")
       .getOrCreate()
 
-    val inputDir = "/Users/roy/Desktop/TGFD/datasets/imdb/300k_imdb_split4/300k_4/imdb3-170909.nt"
+    val inputDir = "/Users/roy/Desktop/TGFD/datasets/imdb/300k_imdb_split4/300k_1/imdb0-170909.nt"
 
     val conf = new Configuration()
     val fs = FileSystem.get(new java.net.URI(inputDir), conf)

@@ -2,17 +2,17 @@ package tgfdDiscovery.script
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
-import org.apache.log4j.Logger
+import org.apache.log4j.{Level, Logger}
 import org.apache.spark.graphx.{Edge, Graph, VertexId}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import tgfdDiscovery.common.IMDBGraphUtils.{createIMDBEdges, createIMDBVertices}
 import tgfdDiscovery.common.VertexData
+import tgfdDiscovery.script.GraphPartitionByEdge.{attributeRegex, literalRegex, logger, uriRegex}
 
-import scala.collection.mutable
 import scala.util.matching.Regex
 
-object graphPartitioner {
+object GraphParitionByEdgeIMDB {
   val logger = Logger.getLogger(this.getClass.getName)
 
   // 正则表达式定义
@@ -22,29 +22,18 @@ object graphPartitioner {
   val attributeRegex: Regex = "/([^/>]+)>$".r
 
   def main(args: Array[String]): Unit = {
-    if (args.length < 2) {
-      logger.error("Usage: IMDBLoader <input_directory> <output_directory>")
-      System.exit(1)
-    }
+    Logger.getLogger("org").setLevel(Level.WARN)
+    Logger.getLogger("akka").setLevel(Level.WARN)
 
     val spark = SparkSession
       .builder
-      .appName("IMDB Graph Partitioner")
+      .appName("RDF Graph Loader")
+      .master("local[*]")
       .getOrCreate()
 
-    spark.sparkContext.setLogLevel("WARN")
-
-    val inputDir = args(0)
-    val outputDir = args(1)
-
-//        val spark = SparkSession
-//          .builder
-//          .appName("RDF Graph Loader")
-//          .master("local[*]")
-//          .getOrCreate()
-//
-//        val inputDir = "/Users/roy/Desktop/TGFD/datasets/imdb/1m_imdb_old/imdb-180909.nt"
-//        val outputDir = ""
+    val inputDir = "/Users/roy/Desktop/TGFD/datasets/imdb/300k_imdb/imdb-170909.nt"
+    val outputDir = "/Users/roy/Desktop/TGFD/test"
+    val numPartitions = 4
 
     val conf = new Configuration()
     val fs = FileSystem.get(new java.net.URI(inputDir), conf)
@@ -77,40 +66,33 @@ object graphPartitioner {
       val vertices: RDD[(VertexId, VertexData)] = createIMDBVertices(parsedTriplets)
       val edges: RDD[Edge[String]] = createIMDBEdges(parsedTriplets)
       val graph = Graph(vertices, edges)
+      println(s"Original: Number of vertices: ${graph.vertices.count()}, Number of edges: ${graph.edges.count()}")
+      println("====================================")
 
-      val numPartitions = 4
+      // Distribute movie type vertices evenly across partitions
+      val movieVertices = vertices.filter { case (_, vData) => vData.vertexType == "movie" }
+      val partitionedMovieVertices = movieVertices.zipWithIndex().map { case ((vertexId, vertexData), index) =>
+        (index % numPartitions, (vertexId, vertexData))
+      }.groupByKey()
 
-      // 初始化分配状态
-      val initialVertexTypeCounts = graph.vertices
-        .filter { case (_, vertexData) => vertexData != null && vertexData.vertexType != null }
-        .map { case (_, vertexData) => vertexData.vertexType }
-        .distinct()
-        .collect()
-        .map(vertexType => (vertexType, Array.fill(numPartitions)(0)))
-        .toMap
+      // Process each partition to form subgraphs
+      partitionedMovieVertices.collect().foreach { case (partitionId, verticesInPartition) =>
+        val vertexIdsInPartition = verticesInPartition.map(_._1).toSet
+        val edgesInPartition = edges.filter(edge => vertexIdsInPartition.contains(edge.srcId) || vertexIdsInPartition.contains(edge.dstId))
 
-      val vertexTypeCounts = mutable.Map(initialVertexTypeCounts.toSeq: _*)
+        // Collect additional vertex IDs from the edges
+        val additionalVertexIds = edgesInPartition.flatMap(edge => Seq(edge.srcId, edge.dstId)).distinct().collect().toSet
 
-      // 分配顶点到分区
-      val verticesWithPartition = graph.vertices.map {
-        case (vertexId, vertexData) =>
-          (vertexId, (vertexData, assignPartition(vertexData, numPartitions, vertexTypeCounts)))
-      }
+        // Fetch all vertices that are either in the original partition or connected via an edge
+        val allVertexIds = vertexIdsInPartition ++ additionalVertexIds
+        val allVerticesInPartition = vertices.filter{ case (vertexId, _) => allVertexIds.contains(vertexId) }
 
-      val verticesPartitionMap = verticesWithPartition.collectAsMap()
+        // Create an RDD for vertices and edges to form a subgraph
+        val vertexRDD = spark.sparkContext.parallelize(allVerticesInPartition.collect())
+        val edgeRDD = spark.sparkContext.parallelize(edgesInPartition.collect())
 
-      for (partitionId <- 0 until numPartitions) {
-        // 过滤属于当前分区的顶点
-        val verticesInPartition = verticesWithPartition.filter(_._2._2 == partitionId).mapValues(_._1)
-
-        // 过滤属于当前分区的边
-        val edgesInPartition = graph.edges.filter { e =>
-          val srcPartition = verticesPartitionMap.getOrElse(e.srcId, (-1, -1))._2
-          val dstPartition = verticesPartitionMap.getOrElse(e.dstId, (-1, -1))._2
-          srcPartition == partitionId && dstPartition == partitionId
-        }
-
-        val subGraph = Graph(verticesInPartition, edgesInPartition)
+        // Construct the subgraph using the vertices and edges for this partition
+        val subGraph = Graph(vertexRDD, edgeRDD)
 
         println(s"Processing $fileName, partition $partitionId")
         println(s"Number of vertices: ${subGraph.vertices.count()}, Number of edges: ${subGraph.edges.count()}")
@@ -129,7 +111,7 @@ object graphPartitioner {
 
         val outputFilePath = new Path(outputDir, subGraphFileName).toString
 
-        val vertexLines = verticesInPartition.map { case (_, vertexData) =>
+        val vertexLines = vertexRDD.map { case (vertexId, vertexData) =>
           if (vertexData != null && vertexData.vertexType != null && vertexData.uri != null) {
             val uri = s"<http://imdb.org/${vertexData.vertexType}/${vertexData.uri}>"
             vertexData.attributes.toSeq.flatMap { case (attrName, attrValue) =>
@@ -139,8 +121,8 @@ object graphPartitioner {
                 if (mutableAttrValue.endsWith("\\") || mutableAttrValue.endsWith(" \\")) {
                   // Regular expression to remove a backslash or space followed by a backslash at the end of the string
                   val cleanedLiteral = mutableAttrValue
-                    .replaceAll(" \\\\$", "")  // Removes ' \' if it's at the end of the string
-                    .replaceAll("\\\\$", "")   // Removes '\' if it's at the end of the string
+                    .replaceAll(" \\\\$", "") // Removes ' \' if it's at the end of the string
+                    .replaceAll("\\\\$", "") // Removes '\' if it's at the end of the string
                   mutableAttrValue = cleanedLiteral
                 }
 
@@ -154,7 +136,7 @@ object graphPartitioner {
         val vertexRdd = subGraph.vertices
 
         // 将边与其源顶点和目标顶点的数据进行连接
-        val edgesWithVertices = edgesInPartition
+        val edgesWithVertices = edgeRDD
           .map(e => (e.srcId, e))
           .join(vertexRdd)
           .map { case (_, (edge, srcVertexData)) => (edge.dstId, (edge, srcVertexData)) }
@@ -176,6 +158,7 @@ object graphPartitioner {
         val vertexCount = vertexLines.count()
         val edgeCount = edgeLines.count()
 
+        println("Partitioned graph:" + subGraphFileName)
         println(s"Number of vertices: $vertexCount")
         println(s"Number of edges: $edgeCount")
 
@@ -184,24 +167,10 @@ object graphPartitioner {
 
         // 写入到HDFS
         graphData.saveAsTextFile(outputFilePath)
+        println("====================================")
       }
-
     }
     println("FINISHED!!!")
     spark.stop()
-  }
-
-  // 分配顶点到不同分区的函数
-  def assignPartition(vertexData: VertexData, numPartitions: Int, vertexTypeCounts: mutable.Map[String, Array[Int]]): Int = {
-    // 获取该类型顶点的当前分区计数
-    val counts = vertexTypeCounts.getOrElseUpdate(vertexData.vertexType, Array.fill(numPartitions)(0))
-
-    // 选择当前最少的分区
-    val partitionId = counts.zipWithIndex.minBy(_._1)._2
-
-    // 更新计数
-    counts(partitionId) += 1
-
-    partitionId
   }
 }

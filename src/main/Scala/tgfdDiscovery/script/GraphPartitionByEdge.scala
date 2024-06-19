@@ -2,17 +2,18 @@ package tgfdDiscovery.script
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
-import org.apache.log4j.Logger
+import org.apache.log4j.{Level, Logger}
 import org.apache.spark.graphx.{Edge, Graph, VertexId}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import tgfdDiscovery.common.IMDBGraphUtils.{createIMDBEdges, createIMDBVertices}
 import tgfdDiscovery.common.VertexData
+import tgfdDiscovery.script.graphPartitioner.{attributeRegex, literalRegex, logger, uriRegex}
 
 import scala.collection.mutable
 import scala.util.matching.Regex
 
-object graphPartitioner {
+object GraphPartitionByEdge {
   val logger = Logger.getLogger(this.getClass.getName)
 
   // 正则表达式定义
@@ -22,7 +23,10 @@ object graphPartitioner {
   val attributeRegex: Regex = "/([^/>]+)>$".r
 
   def main(args: Array[String]): Unit = {
-    if (args.length < 2) {
+    Logger.getLogger("org").setLevel(Level.WARN)
+    Logger.getLogger("akka").setLevel(Level.WARN)
+
+    if (args.length < 3) {
       logger.error("Usage: IMDBLoader <input_directory> <output_directory>")
       System.exit(1)
     }
@@ -36,15 +40,17 @@ object graphPartitioner {
 
     val inputDir = args(0)
     val outputDir = args(1)
+    val numPartitions = args(2).toInt
 
-//        val spark = SparkSession
-//          .builder
-//          .appName("RDF Graph Loader")
-//          .master("local[*]")
-//          .getOrCreate()
+//    val spark = SparkSession
+//      .builder
+//      .appName("RDF Graph Loader")
+//      .master("local[*]")
+//      .getOrCreate()
 //
-//        val inputDir = "/Users/roy/Desktop/TGFD/datasets/imdb/1m_imdb_old/imdb-180909.nt"
-//        val outputDir = ""
+//    val inputDir = "/Users/roy/Desktop/TGFD/datasets/imdb/300k_imdb/imdb-170909.nt"
+//    val outputDir = "/Users/roy/Desktop/TGFD/test"
+//    val numPartitions = 4
 
     val conf = new Configuration()
     val fs = FileSystem.get(new java.net.URI(inputDir), conf)
@@ -78,37 +84,32 @@ object graphPartitioner {
       val edges: RDD[Edge[String]] = createIMDBEdges(parsedTriplets)
       val graph = Graph(vertices, edges)
 
-      val numPartitions = 4
-
-      // 初始化分配状态
-      val initialVertexTypeCounts = graph.vertices
-        .filter { case (_, vertexData) => vertexData != null && vertexData.vertexType != null }
-        .map { case (_, vertexData) => vertexData.vertexType }
+      val initialEdgePredCounts = graph.edges
+        .map(_.attr)
         .distinct()
         .collect()
-        .map(vertexType => (vertexType, Array.fill(numPartitions)(0)))
+        .map(pred => (pred, Array.fill(numPartitions)(0)))
         .toMap
 
-      val vertexTypeCounts = mutable.Map(initialVertexTypeCounts.toSeq: _*)
+      val edgePredCounts = mutable.Map(initialEdgePredCounts.toSeq: _*)
 
-      // 分配顶点到分区
-      val verticesWithPartition = graph.vertices.map {
-        case (vertexId, vertexData) =>
-          (vertexId, (vertexData, assignPartition(vertexData, numPartitions, vertexTypeCounts)))
+      val edgesWithPartition = graph.edges.map { edge =>
+        val partitionId = assignEdgePartition(edge.attr, numPartitions, edgePredCounts)
+        (edge, partitionId)
       }
 
-      val verticesPartitionMap = verticesWithPartition.collectAsMap()
-
       for (partitionId <- 0 until numPartitions) {
-        // 过滤属于当前分区的顶点
-        val verticesInPartition = verticesWithPartition.filter(_._2._2 == partitionId).mapValues(_._1)
-
         // 过滤属于当前分区的边
-        val edgesInPartition = graph.edges.filter { e =>
-          val srcPartition = verticesPartitionMap.getOrElse(e.srcId, (-1, -1))._2
-          val dstPartition = verticesPartitionMap.getOrElse(e.dstId, (-1, -1))._2
-          srcPartition == partitionId && dstPartition == partitionId
-        }
+        val edgesInPartition = edgesWithPartition.filter(_._2 == partitionId).map(_._1)
+
+        // 获取当前分区内的顶点ID
+        val vertexIdsInPartition = edgesInPartition.flatMap(edge => Seq(edge.srcId, edge.dstId)).distinct()
+
+        // 通过 join 获取顶点数据
+        val verticesInPartition = vertexIdsInPartition
+          .map(id => (id, id))
+          .join(graph.vertices)
+          .map { case (_, (id, data)) => (id, data) }
 
         val subGraph = Graph(verticesInPartition, edgesInPartition)
 
@@ -129,7 +130,7 @@ object graphPartitioner {
 
         val outputFilePath = new Path(outputDir, subGraphFileName).toString
 
-        val vertexLines = verticesInPartition.map { case (_, vertexData) =>
+        val vertexLines = verticesInPartition.map { case (vertexId, vertexData) =>
           if (vertexData != null && vertexData.vertexType != null && vertexData.uri != null) {
             val uri = s"<http://imdb.org/${vertexData.vertexType}/${vertexData.uri}>"
             vertexData.attributes.toSeq.flatMap { case (attrName, attrValue) =>
@@ -139,8 +140,8 @@ object graphPartitioner {
                 if (mutableAttrValue.endsWith("\\") || mutableAttrValue.endsWith(" \\")) {
                   // Regular expression to remove a backslash or space followed by a backslash at the end of the string
                   val cleanedLiteral = mutableAttrValue
-                    .replaceAll(" \\\\$", "")  // Removes ' \' if it's at the end of the string
-                    .replaceAll("\\\\$", "")   // Removes '\' if it's at the end of the string
+                    .replaceAll(" \\\\$", "") // Removes ' \' if it's at the end of the string
+                    .replaceAll("\\\\$", "") // Removes '\' if it's at the end of the string
                   mutableAttrValue = cleanedLiteral
                 }
 
@@ -191,17 +192,15 @@ object graphPartitioner {
     spark.stop()
   }
 
-  // 分配顶点到不同分区的函数
-  def assignPartition(vertexData: VertexData, numPartitions: Int, vertexTypeCounts: mutable.Map[String, Array[Int]]): Int = {
-    // 获取该类型顶点的当前分区计数
-    val counts = vertexTypeCounts.getOrElseUpdate(vertexData.vertexType, Array.fill(numPartitions)(0))
-
+  // 分配边到不同分区的函数
+  def assignEdgePartition(pred: String, numPartitions: Int, edgePredCounts: mutable.Map[String, Array[Int]]): Int = {
+    // 获取该pred的当前分区计数
+    val counts = edgePredCounts.getOrElseUpdate(pred, Array.fill(numPartitions)(0))
     // 选择当前最少的分区
     val partitionId = counts.zipWithIndex.minBy(_._1)._2
-
     // 更新计数
     counts(partitionId) += 1
-
     partitionId
   }
+
 }
