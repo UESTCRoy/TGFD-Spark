@@ -2,17 +2,21 @@ package tgfdDiscovery.script
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
-import org.apache.log4j.Logger
+import org.apache.log4j.{Level, Logger}
 import org.apache.spark.graphx.{Edge, Graph, VertexId}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import tgfdDiscovery.common.IMDBGraphUtils.{createIMDBEdges, createIMDBVertices, extractIMDBType, extractIMDBVertexURI, isDesiredType}
 import tgfdDiscovery.common.VertexData
+import tgfdDiscovery.script.LocalIMDBReader.countPredicates
 
 import scala.util.matching.Regex
 
 object CustomIMDBGraph {
   val logger = Logger.getLogger(this.getClass.getName)
+
+  Logger.getLogger("org").setLevel(Level.WARN)
+  Logger.getLogger("akka").setLevel(Level.WARN)
 
   // 正则表达式定义
   val uriRegex: Regex = "<[^>]+>".r
@@ -21,31 +25,31 @@ object CustomIMDBGraph {
   val attributeRegex: Regex = "/([^/>]+)>$".r
 
   def main(args: Array[String]): Unit = {
-        if (args.length < 3) {
-          logger.error("Usage: IMDBLoader <input_directory> <output_directory>")
-          System.exit(1)
-        }
+    if (args.length < 3) {
+      logger.error("Usage: IMDBLoader <input_directory> <output_directory>")
+      System.exit(1)
+    }
 
-        val spark = SparkSession
-          .builder
-          .appName("Generate Custom IMDB Graph")
-          .getOrCreate()
+    val spark = SparkSession
+      .builder
+      .appName("Generate Custom IMDB Graph")
+      .getOrCreate()
 
-        spark.sparkContext.setLogLevel("WARN")
+    spark.sparkContext.setLogLevel("WARN")
 
-        val inputDir = args(0)
-        val outputDir = args(1)
-        val edgeSize = args(2)
+    val inputDir = args(0)
+    val outputDir = args(1)
+    val edgeSize = args(2)
 
-//    val spark = SparkSession
-//      .builder
-//      .appName("RDF Graph Loader")
-//      .master("local[*]")
-//      .getOrCreate()
-//
-//    val inputDir = "/Users/roy/Desktop/TGFD/datasets/imdb/1m_imdb_old/imdb-170909.nt"
-//    val outputDir = "/Users/roy/Desktop/TGFD/test"
-//    val edgeSize = 10000000
+    //    val spark = SparkSession
+    //      .builder
+    //      .appName("RDF Graph Loader")
+    //      .master("local[*]")
+    //      .getOrCreate()
+    //
+    //    val inputDir = "/Users/roy/Desktop/TGFD/datasets/imdb/1m_imdb_old/imdb-170909.nt"
+    //    val outputDir = "/Users/roy/Desktop/TGFD/test"
+    //    val edgeSize = 1000000
 
     val conf = new Configuration()
     val fs = FileSystem.get(new java.net.URI(inputDir), conf)
@@ -84,28 +88,8 @@ object CustomIMDBGraph {
       edges.cache()
 
       val selectedEdgesRDD = if (previousSelectedEdges.isEmpty) {
-        val graph = Graph(vertices, edges)
-        val inDegrees: RDD[(VertexId, Int)] = graph.inDegrees
-        val outDegrees: RDD[(VertexId, Int)] = graph.outDegrees
-
-        val degrees: RDD[(VertexId, (Int, Int))] = inDegrees.fullOuterJoin(outDegrees)
-          .mapValues {
-            case (inOpt, outOpt) => (inOpt.getOrElse(0), outOpt.getOrElse(0))
-          }
-
-        // 筛选出入度和出度都大于一的顶点
-        val validVertices = degrees
-          .filter { case (_, (inDeg, outDeg)) => inDeg > 1 || outDeg > 1 }
-          .map(_._1)
-          .collect()
-          .toSet
-
-        // 根据有效顶点筛选边
-        val validEdges = graph.edges
-          .filter(e => validVertices.contains(e.srcId) && validVertices.contains(e.dstId))
-
         // 从筛选后的边中随机选择
-        val initialSelectedEdgesArray = validEdges.takeSample(withReplacement = false, edgeSize.toInt)
+        val initialSelectedEdgesArray = edges.takeSample(withReplacement = false, edgeSize.toInt)
 
         spark.sparkContext.parallelize(initialSelectedEdgesArray)
       } else {
@@ -125,13 +109,48 @@ object CustomIMDBGraph {
         .join(edgeVertices)
         .mapValues(_._1)
 
-      val newGraph = Graph(filteredVertices, selectedEdgesRDD)
+      val graph = Graph(filteredVertices, selectedEdgesRDD)
+      val nonNullVertices = graph.vertices.filter { case (_, vertexData) => vertexData != null && vertexData.vertexType != null }
+      val nonNullEdges = graph.edges.filter { case Edge(srcId, dstId, attr) => attr != null }
 
-      println(s"Number of Valid vertices: ${newGraph.vertices.count()}, Number of Valid edges: ${newGraph.edges.count()}")
+      println(s"Number of Valid vertices: ${graph.vertices.count()}, Number of Valid edges: ${graph.edges.count()}")
+
+      // 计算所有顶点的入度
+      val vertexInDegrees = nonNullEdges.map(e => (e.dstId, 1)).reduceByKey(_ + _)
+
+      // 标记类型为movie的顶点
+      val movieVertices = nonNullVertices.filter { case (_, vertexData) => vertexData.vertexType == "movie" }
+      val movieVertexIds = movieVertices.map(_._1).collect().toSet
+
+      // 筛选符合入度要求的movie顶点和超过入度要求的movie顶点
+      val invalidMovieVertexIds = vertexInDegrees.filter { case (vertexId, count) => count > 100 && movieVertexIds.contains(vertexId) }.keys.collect().toSet
+
+      // 删除与入度超过100的movie顶点相关的边
+      val validEdges = nonNullEdges.filter(e => !invalidMovieVertexIds.contains(e.srcId) && !invalidMovieVertexIds.contains(e.dstId))
+
+      // 使用过滤后的顶点和边构建新图
+      val validVertices = nonNullVertices.filter { case (vertexId, _) => !invalidMovieVertexIds.contains(vertexId) }
+      val newGraph = Graph(validVertices, validEdges)
+      println(s"Number of filter vertices: ${newGraph.vertices.count()}, Number of filter edges: ${newGraph.edges.count()}")
+
+      val vertexTypeCount = nonNullVertices.map(_._2.vertexType).countByValue()
+
+      // Logging the results
+      vertexTypeCount.foreach { case (vertexType, count) =>
+        println(s"Vertex Type: $vertexType, Count: $count")
+      }
+
+      // Count predicates
+      val predicateCounts = countPredicates(newGraph.edges)
+
+      // Log predicate counts
+      predicateCounts.collect().foreach { case (predicate, count) =>
+        println(s"Predicate: $predicate, Count: $count")
+      }
 
       val outputFilePath = new Path(outputDir, fileName).toString
 
-      val vertexLines = filteredVertices.map { case (_, vertexData: VertexData) =>
+      val vertexLines = validVertices.map { case (_, vertexData: VertexData) =>
         if (vertexData != null && vertexData.vertexType != null && vertexData.uri != null) {
           val uri = s"<http://imdb.org/${vertexData.vertexType}/${vertexData.uri}>"
           vertexData.attributes.toSeq.flatMap { case (attrName, attrValue) =>
@@ -141,8 +160,8 @@ object CustomIMDBGraph {
               if (mutableAttrValue.endsWith("\\") || mutableAttrValue.endsWith(" \\")) {
                 // Regular expression to remove a backslash or space followed by a backslash at the end of the string
                 val cleanedLiteral = mutableAttrValue
-                  .replaceAll(" \\\\$", "")  // Removes ' \' if it's at the end of the string
-                  .replaceAll("\\\\$", "")   // Removes '\' if it's at the end of the string
+                  .replaceAll(" \\\\$", "") // Removes ' \' if it's at the end of the string
+                  .replaceAll("\\\\$", "") // Removes '\' if it's at the end of the string
                 mutableAttrValue = cleanedLiteral
               }
 

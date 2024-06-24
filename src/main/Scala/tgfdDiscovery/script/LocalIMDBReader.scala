@@ -3,7 +3,7 @@ package tgfdDiscovery.script
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.log4j.{Level, Logger}
-import org.apache.spark.graphx.{Edge, VertexId}
+import org.apache.spark.graphx.{Edge, Graph, VertexId}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import tgfdDiscovery.common.IMDBGraphUtils.{createIMDBEdges, createIMDBVertices, isDesiredType}
@@ -29,7 +29,7 @@ object LocalIMDBReader {
       .master("local[*]")
       .getOrCreate()
 
-    val inputDir = "/Users/roy/Desktop/TGFD/datasets/imdb/1m_imdb_split4/1m_3/imdb2-170909.nt"
+    val inputDir = "/Users/roy/Desktop/TGFD/datasets/imdb/1m_imdb_test/imdb-180209.nt"
 
     val conf = new Configuration()
     val fs = FileSystem.get(new java.net.URI(inputDir), conf)
@@ -82,6 +82,64 @@ object LocalIMDBReader {
         println(s"Predicate: $predicate, Count: $count")
       }
 
+      val graph = Graph(vertices, edges)
+      val inDegrees = graph.inDegrees
+      val outDegrees = graph.outDegrees
+
+      val movieVertices = graph.vertices.filter { case (_, vData) => vData.vertexType == "movie" }
+
+      val movieInDegrees = inDegrees.join(movieVertices).map { case (id, (deg, _)) => (id, deg) }
+      val movieOutDegrees = outDegrees.join(movieVertices).map { case (id, (deg, _)) => (id, deg) }
+
+      // Calculate total inDegrees and outDegrees
+      val totalInDegrees = inDegrees.values.sum()
+      val totalOutDegrees = outDegrees.values.sum()
+      println(s"Total inDegrees for 'movie' vertices: $totalInDegrees")
+      println(s"Total outDegrees for 'movie' vertices: $totalOutDegrees")
+
+      // Find the max inDegree and outDegree
+      val maxInDegree = movieInDegrees.values.max()
+      val maxOutDegree = movieOutDegrees.values.max()
+      println(s"Max inDegree for 'movie' vertices: $maxInDegree")
+      println(s"Max outDegree for 'movie' vertices: $maxOutDegree")
+
+      // Calculate the vertex with the maximum in-degree
+      val maxInDegreeVertex = movieInDegrees.reduce((a, b) => if (a._2 > b._2) a else b)
+
+      // Find details of the vertex with the maximum in-degree directly from the vertices RDD
+      val vertexWithMaxInDegree = movieVertices.filter {
+        case (id, _) => id == maxInDegreeVertex._1
+      }.collect()
+
+      // Print the details of the vertex with the maximum in-degree
+      vertexWithMaxInDegree.foreach { case (id, data) =>
+        println(s"Vertex with max in-degree: ID = $id, Data = $data, Max in-degree = ${maxInDegreeVertex._2}")
+      }
+
+
+      // 统计最大indegree的vertex
+//      // Calculate the vertex with the maximum in-degree
+//      val maxInDegreeVertex = inDegrees.reduce((a, b) => if (a._2 > b._2) a else b)
+//
+//      // Find details of the vertex with the maximum in-degree directly from the vertices RDD
+//      val vertexWithMaxInDegree = movieVertices.filter {
+//        case (id, _) => id == maxInDegreeVertex._1
+//      }.collect()
+//
+//      // Print the details of the vertex with the maximum in-degree
+//      vertexWithMaxInDegree.foreach { case (id, data) =>
+//        println(s"Vertex with max in-degree: ID = $id, Data = $data, Max in-degree = ${maxInDegreeVertex._2}")
+//      }
+
+      // 统计indegree超过50的vertex
+      // Filter vertices with in-degree greater than 50
+//      val moderateInDegreeVertices = inDegrees.filter { case (_, degree) => degree > 1 && degree < 100 }
+//
+//      // Count the number of vertices with in-degree greater than 50
+//      val moderateInDegreeCount = moderateInDegreeVertices.count()
+//
+//      // Output the count
+//      println(s"Number of 'movie' vertices with in-degree > 1 and < 100: $moderateInDegreeCount")
     }
 
     spark.stop()
