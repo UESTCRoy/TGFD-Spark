@@ -6,7 +6,7 @@ import org.apache.log4j.Logger
 import org.apache.spark.graphx.{Edge, Graph, VertexId}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
-import tgfdDiscovery.common.IMDBGraphUtils.{createIMDBEdges, createIMDBVertices}
+import IMDBGraphUtils.{createIMDBEdges, createIMDBVertices}
 import tgfdDiscovery.common.VertexData
 
 import scala.collection.mutable

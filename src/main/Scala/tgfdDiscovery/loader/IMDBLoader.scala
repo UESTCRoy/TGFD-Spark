@@ -7,7 +7,7 @@ import java.time.format.DateTimeFormatter
 import org.apache.spark.graphx.{Edge, Graph, VertexId}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
-import tgfdDiscovery.common.IMDBGraphUtils.{attributeRegex, createIMDBEdges, createIMDBVertices, isDesiredType, literalRegex, uriRegex}
+import tgfdDiscovery.script.IMDBGraphUtils.{attributeRegex, createIMDBEdges, createIMDBVertices, isDesiredType, literalRegex, uriRegex}
 import tgfdDiscovery.common.VertexData
 
 object IMDBLoader {

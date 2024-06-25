@@ -1,7 +1,8 @@
-package tgfdDiscovery.common
+package tgfdDiscovery.script
 
 import org.apache.spark.graphx.{Edge, VertexId}
 import org.apache.spark.rdd.RDD
+import tgfdDiscovery.common.VertexData
 
 import scala.collection.mutable
 import scala.util.matching.Regex
