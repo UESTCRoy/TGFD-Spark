@@ -72,9 +72,10 @@ object GraphPartitionByMovieVertexIMDB {
 
     // Distribute movie type vertices evenly across partitions
     val movieVertices = vertices.filter { case (_, vData) => vData.vertexType == "movie" }
-    val partitionedMovieVertices = movieVertices.zipWithIndex().map { case ((vertexId, vertexData), index) =>
-      (index % numPartitions, (vertexId, vertexData))
-    }.groupByKey()
+    val partitionedMovieVertices = movieVertices.map { case (vertexId, vertexData) =>
+      val hash = vertexId.hashCode()
+      (hash % numPartitions, (vertexId, vertexData))
+    }.groupByKey(numPartitions)
 
     // Process each partition to form subgraphs
     partitionedMovieVertices.collect().foreach { case (partitionId, verticesInPartition) =>

@@ -29,7 +29,7 @@ object LocalIMDBReader {
       .master("local[*]")
       .getOrCreate()
 
-    val inputDir = "/Users/roy/Desktop/TGFD/datasets/imdb/1m_imdb_test/imdb-180209.nt"
+    val inputDir = "/Users/roy/Desktop/TGFD/datasets/imdb/700k_imdb_split4/700k_4/imdb3-170909.nt"
 
     val conf = new Configuration()
     val fs = FileSystem.get(new java.net.URI(inputDir), conf)
@@ -92,8 +92,8 @@ object LocalIMDBReader {
       val movieOutDegrees = outDegrees.join(movieVertices).map { case (id, (deg, _)) => (id, deg) }
 
       // Calculate total inDegrees and outDegrees
-      val totalInDegrees = inDegrees.values.sum()
-      val totalOutDegrees = outDegrees.values.sum()
+      val totalInDegrees = movieInDegrees.values.sum()
+      val totalOutDegrees = movieOutDegrees.values.sum()
       println(s"Total inDegrees for 'movie' vertices: $totalInDegrees")
       println(s"Total outDegrees for 'movie' vertices: $totalOutDegrees")
 
@@ -102,19 +102,19 @@ object LocalIMDBReader {
       val maxOutDegree = movieOutDegrees.values.max()
       println(s"Max inDegree for 'movie' vertices: $maxInDegree")
       println(s"Max outDegree for 'movie' vertices: $maxOutDegree")
-
-      // Calculate the vertex with the maximum in-degree
-      val maxInDegreeVertex = movieInDegrees.reduce((a, b) => if (a._2 > b._2) a else b)
-
-      // Find details of the vertex with the maximum in-degree directly from the vertices RDD
-      val vertexWithMaxInDegree = movieVertices.filter {
-        case (id, _) => id == maxInDegreeVertex._1
-      }.collect()
-
-      // Print the details of the vertex with the maximum in-degree
-      vertexWithMaxInDegree.foreach { case (id, data) =>
-        println(s"Vertex with max in-degree: ID = $id, Data = $data, Max in-degree = ${maxInDegreeVertex._2}")
-      }
+//
+//      // Calculate the vertex with the maximum in-degree
+//      val maxInDegreeVertex = movieInDegrees.reduce((a, b) => if (a._2 > b._2) a else b)
+//
+//      // Find details of the vertex with the maximum in-degree directly from the vertices RDD
+//      val vertexWithMaxInDegree = movieVertices.filter {
+//        case (id, _) => id == maxInDegreeVertex._1
+//      }.collect()
+//
+//      // Print the details of the vertex with the maximum in-degree
+//      vertexWithMaxInDegree.foreach { case (id, data) =>
+//        println(s"Vertex with max in-degree: ID = $id, Data = $data, Max in-degree = ${maxInDegreeVertex._2}")
+//      }
 
 
       // 统计最大indegree的vertex
