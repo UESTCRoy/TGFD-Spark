@@ -6,7 +6,7 @@ import org.apache.log4j.{Level, Logger}
 import org.apache.spark.graphx.{Edge, Graph}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
-import tgfdDiscovery.common.VertexData
+import tgfdDiscovery.common.{SimpleStatement, VertexData}
 
 import java.io.{File, FileOutputStream, PrintWriter}
 import scala.collection.mutable
@@ -20,7 +20,7 @@ object CustomDBPediaFromRDF {
 
   def main(args: Array[String]): Unit = {
     if (args.length < 3) {
-      logger.error("Usage: IMDBLoader <input_directory> <output_directory>")
+      logger.error("Usage: DBPediaLoader <input_directory> <output_directory>")
       System.exit(1)
     }
 
@@ -37,13 +37,15 @@ object CustomDBPediaFromRDF {
 
     val years = Seq("2014", "2015", "2016", "2017")
 
-    val sc = spark.sparkContext
-
-    def loadRDF(year: String, fileType: String): RDD[Statement] = {
+    // Function to load RDF data and convert to SimpleStatement RDD
+    def loadRDF(year: String, fileType: String): RDD[SimpleStatement] = {
       val model = ModelFactory.createDefaultModel()
       RDFDataMgr.read(model, s"$baseDir/$year$fileType.ttl")
-      sc.parallelize(model.listStatements().toList.asScala)
+      spark.sparkContext.parallelize(model.listStatements().asScala.map(stmt =>
+        SimpleStatement(stmt.getSubject.toString, stmt.getPredicate.toString, stmt.getObject.toString)).toList)
     }
+
+    def extractLastPart(uri: String): String = uri.substring(uri.lastIndexOf("/") + 1).toLowerCase
 
     years.foreach { year =>
       // Load and process RDF data
@@ -53,23 +55,14 @@ object CustomDBPediaFromRDF {
 
       // Create vertices with types
       val verticesRDD: RDD[(Long, VertexData)] = typesData
-        .filter(_.getPredicate.getLocalName.equalsIgnoreCase("type"))
-        .map(stmt => {
-          val uri = stmt.getSubject.getURI.toLowerCase
-          val vertexType = stmt.getObject.asResource.getLocalName.toLowerCase
-          val attributes = new mutable.HashMap[String, String]()
-          (uri.hashCode.toLong, VertexData(uri, vertexType, attributes))
-        })
+        .filter(_.predicate.endsWith("#type"))
+        .map(stmt => (stmt.subject.toLowerCase.hashCode.toLong, VertexData(stmt.subject, extractLastPart(stmt.objectStr), new mutable.HashMap())))
+        .reduceByKey((data1, data2) => data1) // Remove duplicates
 
       // Aggregate attributes into vertices
       val attributesRDD = literalsData
-        .filter(_.getObject.isLiteral)
-        .map(stmt => {
-          val uri = stmt.getSubject.getURI.toLowerCase
-          val prop = stmt.getPredicate.getLocalName.toLowerCase
-          val value = stmt.getObject.toString
-          (uri.hashCode.toLong, (prop, value))
-        })
+        .filter(_.predicate.contains("/ontology/"))
+        .map(stmt => (stmt.subject.toLowerCase.hashCode.toLong, (extractLastPart(stmt.predicate), stmt.objectStr.split("\\^\\^")(0))))
         .groupByKey()
 
       // Join attributes to vertices
@@ -80,23 +73,42 @@ object CustomDBPediaFromRDF {
         case (id, (vertexData, None)) => (id, vertexData)
       }
 
-      // Create edges from object relationships
-      val edgesRDD: RDD[Edge[String]] = objectsData
-        .filter(stmt => !stmt.getObject.isLiteral && stmt.getObject.isURIResource)
-        .map(stmt => {
-          val srcUri = stmt.getSubject.getURI.toLowerCase.hashCode.toLong
-          val dstUri = stmt.getObject.asResource.getURI.toLowerCase.hashCode.toLong
-          val predicate = stmt.getPredicate.getLocalName.toLowerCase
-          Edge(srcUri, dstUri, predicate)
-        })
+      val validEdgesRDD = objectsData
+        .filter(_.objectStr.startsWith("http"))  // Ensuring that object URI is valid
+        .map(stmt => (stmt.subject.toLowerCase.hashCode.toLong, (stmt.objectStr.toLowerCase.hashCode.toLong, extractLastPart(stmt.predicate))))
+        .join(finalVerticesRDD) // Join with source vertex data
+        .map { case (srcId, ((dstId, pred), srcVertexData)) => (dstId, (srcId, pred)) }
+        .join(finalVerticesRDD) // Join with destination vertex data
+        .map { case (dstId, ((srcId, pred), dstVertexData)) =>
+          Edge(srcId, dstId, pred)
+        }
 
-      // Construct the graph
-      val graph = Graph(finalVerticesRDD, edgesRDD)
+      val graph = Graph(finalVerticesRDD, validEdgesRDD)
+      println(s"Number of vertices: ${graph.vertices.count()}, Number of edges: ${graph.edges.count()}")
+
+      val vertexLines = finalVerticesRDD.flatMap { case (_, vertexData) =>
+        val newURI = s"<http://dbpedia.org/${vertexData.vertexType}/${extractLastPart(vertexData.uri)}>"
+        vertexData.attributes.toSeq.map {
+          case (attrName, attrValue) =>
+            s"""$newURI <http://xmlns.com/foaf/0.1/$attrName> "$attrValue" ."""
+        }
+      }
+
+      val edgeLines = objectsData
+        .filter(_.objectStr.startsWith("http"))
+        .map(stmt => (stmt.subject.toLowerCase.hashCode.toLong, (stmt.objectStr.toLowerCase.hashCode.toLong, stmt.predicate.toLowerCase)))
+        .join(finalVerticesRDD)
+        .map { case (srcId, ((dstId, pred), srcVertexData)) => (dstId, (srcId, pred, srcVertexData)) }
+        .join(finalVerticesRDD)
+        .map { case (dstId, ((srcId, pred, srcVertexData), dstVertexData)) =>
+          val srcUri = s"<http://dbpedia.org/${extractLastPart(srcVertexData.vertexType)}/${extractLastPart(srcVertexData.uri)}>"
+          val dstUri = s"<http://dbpedia.org/${extractLastPart(dstVertexData.vertexType)}/${extractLastPart(dstVertexData.uri)}>"
+          s"$srcUri <http://xmlns.com/foaf/0.1/${extractLastPart(pred)}> $dstUri ."
+        }
 
       // Save the combined RDF model
-      val outputPath = s"$baseDir/processed/$year-combined.ttl"
+      val outputPath = s"$baseDir/processed/$year-$edgeSize.ttl"
 
-//      RDFDataMgr.write(new FileOutputStream(outputPath), combinedModel, RDFFormat.TTL)
     }
 
     spark.stop()

@@ -6,12 +6,10 @@ import org.apache.log4j.{Level, Logger}
 import org.apache.spark.graphx.{Edge, Graph}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
-import tgfdDiscovery.common.VertexData
+import tgfdDiscovery.common.{SimpleStatement, VertexData}
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters.{asScalaBufferConverter, asScalaIteratorConverter}
-
-case class SimpleStatement(subject: String, predicate: String, objectStr: String)
 
 object LocalDBPediaTest {
   val logger = Logger.getLogger(this.getClass.getName)
