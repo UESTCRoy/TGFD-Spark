@@ -19,7 +19,7 @@ object CustomDBPediaFromRDF {
   Logger.getLogger("akka").setLevel(Level.WARN)
 
   def main(args: Array[String]): Unit = {
-    if (args.length < 3) {
+    if (args.length < 2) {
       logger.error("Usage: DBPediaLoader <input_directory> <output_directory>")
       System.exit(1)
     }
@@ -33,7 +33,6 @@ object CustomDBPediaFromRDF {
 
     val baseDir = args(0)
     val outputDir = args(1)
-    val edgeSize = args(2)
 
     val years = Seq("2014", "2015", "2016", "2017")
 
@@ -91,20 +90,20 @@ object CustomDBPediaFromRDF {
       // Continue with processing as before
       val vertexLines = connectedGraph.vertices.flatMap {
         case (_, vertexData) =>
-          val newURI = s"<http://dbpedia.org/${vertexData.vertexType}/${extractLastPart(vertexData.uri)}"
+          val newURI = s"<http://dbpedia.org/${vertexData.vertexType}/${extractLastPart(vertexData.uri)}>"
           vertexData.attributes.map {
             case (attrName, attrValue) => s"""$newURI <http://xmlns.com/foaf/0.1/$attrName> "$attrValue" ."""
           }
       }
 
       val edgeLines = connectedGraph.triplets.map { triplet =>
-        val srcUri = s"<http://dbpedia.org/${triplet.srcAttr.vertexType}/${extractLastPart(triplet.srcAttr.uri)}"
-        val dstUri = s"<http://dbpedia.org/${triplet.dstAttr.vertexType}/${extractLastPart(triplet.dstAttr.uri)}"
+        val srcUri = s"<http://dbpedia.org/${triplet.srcAttr.vertexType}/${extractLastPart(triplet.srcAttr.uri)}>"
+        val dstUri = s"<http://dbpedia.org/${triplet.dstAttr.vertexType}/${extractLastPart(triplet.dstAttr.uri)}>"
         s"$srcUri <http://xmlns.com/foaf/0.1/${triplet.attr}> $dstUri ."
       }
 
       val graphData = vertexLines.union(edgeLines)
-      val outputPath = s"$outputDir/$year-$edgeSize.nt"
+      val outputPath = s"$outputDir/$year.nt"
       graphData.saveAsTextFile(outputPath)
     }
     println("Data saved successfully")

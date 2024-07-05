@@ -8,11 +8,17 @@ import tgfdDiscovery.common.VertexData
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters.asScalaIteratorConverter
+import scala.util.matching.Regex
 
 // Two Version:
 // 1. VertexData -> (String, List[String]) for script
 // 2. VertexData -> VertexData for spark mining
 object DBPediaGraphUtils {
+  val uriRegex: Regex = "<[^>]+>".r
+  val literalRegex: Regex = "\"[^\"]+\"".r
+  val attributeRegex: Regex = "/([^/>]+)>$".r
+  val dbpediaUriRegex: Regex = "<http://dbpedia.org/([^/]+)/([^>]+)>".r
+  
   //  def createGraph(model: Model, spark: SparkSession): Graph[VertexData, String] = {
   def createGraph(model: Model, spark: SparkSession): Graph[(String, List[String]), String] = {
     val vertices: RDD[(VertexId, (String, List[String]))] = spark.sparkContext.parallelize(
@@ -24,34 +30,6 @@ object DBPediaGraphUtils {
         (id, (uri, properties))
       }.toList
     )
-
-    //    val vertices: RDD[(VertexId, VertexData)] = spark.sparkContext.parallelize(
-    //      model.listSubjects().asScala.filter(_.isURIResource).map { resource =>
-    //        val uri = resource.getURI
-    //        val id = uri.hashCode.toLong
-    //
-    //        // Determine vertex type (adjust RDF property as needed)
-    //        val vertexType = model.listStatements(resource, model.getProperty("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"), null)
-    //          .asScala.toSeq.headOption
-    //          .map(_.getObject.asResource.getURI)
-    //          .getOrElse("Unknown")
-    //
-    //        // Collect attributes
-    //        val attributes = mutable.HashMap[String, String]()
-    //        model.listStatements(resource, null, null).asScala.foreach { stmt =>
-    //          if (!stmt.getPredicate.getURI.endsWith("#type")) {
-    //            val objectValue = if (stmt.getObject.isLiteral) {
-    //              stmt.getObject.asLiteral.getString
-    //            } else {
-    //              stmt.getObject.toString
-    //            }
-    //            attributes(stmt.getPredicate.getLocalName) = objectValue
-    //          }
-    //        }
-    //
-    //        (id, VertexData(uri, vertexType, attributes))
-    //      }.toList
-    //    )
 
     // Force materialization to debug
     val vertexCount = vertices.count()
@@ -75,5 +53,48 @@ object DBPediaGraphUtils {
     println(s"Total edges loaded: $edgeCount")
 
     Graph(vertices, edges)
+  }
+
+  def createDBPediaVertices(parsedTriplets: RDD[(String, String, String, String)]): RDD[(VertexId, VertexData)] = {
+    parsedTriplets
+      .filter(_._4 == "attribute")
+      .map { case (subj, attrName, attrValue, _) =>
+        val subURI = extractDBPediaVertexURI(subj)
+        val vertexType = extractDBPediaType(subj)
+        ((subURI, vertexType), mutable.HashMap(attrName -> attrValue))
+      }
+      .reduceByKey { (attrs1, attrs2) =>
+        attrs1 ++= attrs2
+      }
+      .map { case ((uri, vertexType), attributes) =>
+        val id = (uri + vertexType).hashCode.toLong
+        (id, VertexData(uri = uri, vertexType = vertexType, attributes = attributes))
+      }
+  }
+
+  def createDBPediaEdges(parsedTriplets: RDD[(String, String, String, String)]): RDD[Edge[String]] = {
+    parsedTriplets
+      .filter(_._4 == "edge")
+      .map { case (subj, pred, obj, _) =>
+        val subURI = extractDBPediaVertexURI(subj)
+        val subType = extractDBPediaType(subj)
+        val objURI = extractDBPediaVertexURI(obj)
+        val objType = extractDBPediaType(obj)
+        Edge((subURI + subType).hashCode.toLong, (objURI + objType).hashCode.toLong, pred)
+      }
+  }
+
+  def extractDBPediaVertexURI(uri: String): String = {
+    uri match {
+      case dbpediaUriRegex(_, resourceIdentifier) => resourceIdentifier
+      case _ => "unknownResource"
+    }
+  }
+
+  def extractDBPediaType(uri: String): String = {
+    uri match {
+      case dbpediaUriRegex(resourceType, _) => resourceType
+      case _ => "unknownType"
+    }
   }
 }
