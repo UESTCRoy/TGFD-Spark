@@ -40,7 +40,7 @@ object CustomDBPediaFromRDF {
     // Function to load RDF data and convert to SimpleStatement RDD
     def loadRDF(year: String, fileType: String): RDD[SimpleStatement] = {
       val model = ModelFactory.createDefaultModel()
-      RDFDataMgr.read(model, s"$baseDir/$year$fileType.ttl")
+      RDFDataMgr.read(model, s"$baseDir/$year/$year$fileType.ttl")
       spark.sparkContext.parallelize(model.listStatements().asScala.map(stmt =>
         SimpleStatement(stmt.getSubject.toString, stmt.getPredicate.toString, stmt.getObject.toString)).toList)
     }
@@ -53,19 +53,16 @@ object CustomDBPediaFromRDF {
       val literalsData = loadRDF(year, "literals")
       val objectsData = loadRDF(year, "objects")
 
-      // Create vertices with types
       val verticesRDD: RDD[(Long, VertexData)] = typesData
         .filter(_.predicate.endsWith("#type"))
         .map(stmt => (stmt.subject.toLowerCase.hashCode.toLong, VertexData(stmt.subject, extractLastPart(stmt.objectStr), new mutable.HashMap())))
-        .reduceByKey((data1, data2) => data1) // Remove duplicates
+        .reduceByKey((data1, data2) => data1)
 
-      // Aggregate attributes into vertices
       val attributesRDD = literalsData
         .filter(_.predicate.contains("/ontology/"))
         .map(stmt => (stmt.subject.toLowerCase.hashCode.toLong, (extractLastPart(stmt.predicate), stmt.objectStr.split("\\^\\^")(0))))
         .groupByKey()
 
-      // Join attributes to vertices
       val finalVerticesRDD = verticesRDD.leftOuterJoin(attributesRDD).map {
         case (id, (vertexData, Some(attrs))) =>
           attrs.foreach { case (prop, value) => vertexData.attributes += (prop -> value) }
@@ -73,44 +70,44 @@ object CustomDBPediaFromRDF {
         case (id, (vertexData, None)) => (id, vertexData)
       }
 
-      val validEdgesRDD = objectsData
-        .filter(_.objectStr.startsWith("http"))  // Ensuring that object URI is valid
+      val filteredEdgesRDD = objectsData
+        .filter(stmt => stmt.objectStr.startsWith("http") && !stmt.predicate.toLowerCase.endsWith("seealso"))
         .map(stmt => (stmt.subject.toLowerCase.hashCode.toLong, (stmt.objectStr.toLowerCase.hashCode.toLong, extractLastPart(stmt.predicate))))
-        .join(finalVerticesRDD) // Join with source vertex data
-        .map { case (srcId, ((dstId, pred), srcVertexData)) => (dstId, (srcId, pred)) }
-        .join(finalVerticesRDD) // Join with destination vertex data
-        .map { case (dstId, ((srcId, pred), dstVertexData)) =>
-          Edge(srcId, dstId, pred)
-        }
+        .join(finalVerticesRDD)
+        .map { case (srcId, ((dstId, pred), _)) => (dstId, (srcId, pred)) }
+        .join(finalVerticesRDD)
+        .map { case (dstId, ((srcId, pred), _)) => Edge(srcId, dstId, pred) }
 
-      val graph = Graph(finalVerticesRDD, validEdgesRDD)
-      println(s"Number of vertices: ${graph.vertices.count()}, Number of edges: ${graph.edges.count()}")
+      val graph = Graph(finalVerticesRDD, filteredEdgesRDD)
+      println(s"Graph created with ${graph.vertices.count()} vertices and ${graph.edges.count()} edges.")
 
-      val vertexLines = finalVerticesRDD.flatMap { case (_, vertexData) =>
-        val newURI = s"<http://dbpedia.org/${vertexData.vertexType}/${extractLastPart(vertexData.uri)}>"
-        vertexData.attributes.toSeq.map {
-          case (attrName, attrValue) =>
-            s"""$newURI <http://xmlns.com/foaf/0.1/$attrName> "$attrValue" ."""
-        }
+      // Compute the degrees and create a connected graph
+      val degreesRDD = graph.degrees.cache()
+      val connectedGraph = graph.outerJoinVertices(degreesRDD) {
+        (vid, vd, degreeOpt) => (vd, degreeOpt.getOrElse(0))
+      }.subgraph(vpred = (_, attr) => attr._2 > 0).mapVertices((id, attr) => attr._1)
+      println(s"Connected graph created with ${connectedGraph.vertices.count()} vertices and ${connectedGraph.edges.count()} edges.")
+
+      // Continue with processing as before
+      val vertexLines = connectedGraph.vertices.flatMap {
+        case (_, vertexData) =>
+          val newURI = s"<http://dbpedia.org/${vertexData.vertexType}/${extractLastPart(vertexData.uri)}"
+          vertexData.attributes.map {
+            case (attrName, attrValue) => s"""$newURI <http://xmlns.com/foaf/0.1/$attrName> "$attrValue" ."""
+          }
       }
 
-      val edgeLines = objectsData
-        .filter(_.objectStr.startsWith("http"))
-        .map(stmt => (stmt.subject.toLowerCase.hashCode.toLong, (stmt.objectStr.toLowerCase.hashCode.toLong, stmt.predicate.toLowerCase)))
-        .join(finalVerticesRDD)
-        .map { case (srcId, ((dstId, pred), srcVertexData)) => (dstId, (srcId, pred, srcVertexData)) }
-        .join(finalVerticesRDD)
-        .map { case (dstId, ((srcId, pred, srcVertexData), dstVertexData)) =>
-          val srcUri = s"<http://dbpedia.org/${extractLastPart(srcVertexData.vertexType)}/${extractLastPart(srcVertexData.uri)}>"
-          val dstUri = s"<http://dbpedia.org/${extractLastPart(dstVertexData.vertexType)}/${extractLastPart(dstVertexData.uri)}>"
-          s"$srcUri <http://xmlns.com/foaf/0.1/${extractLastPart(pred)}> $dstUri ."
-        }
+      val edgeLines = connectedGraph.triplets.map { triplet =>
+        val srcUri = s"<http://dbpedia.org/${triplet.srcAttr.vertexType}/${extractLastPart(triplet.srcAttr.uri)}"
+        val dstUri = s"<http://dbpedia.org/${triplet.dstAttr.vertexType}/${extractLastPart(triplet.dstAttr.uri)}"
+        s"$srcUri <http://xmlns.com/foaf/0.1/${triplet.attr}> $dstUri ."
+      }
 
-      // Save the combined RDF model
-      val outputPath = s"$baseDir/processed/$year-$edgeSize.ttl"
-
+      val graphData = vertexLines.union(edgeLines)
+      val outputPath = s"$outputDir/$year-$edgeSize.nt"
+      graphData.saveAsTextFile(outputPath)
     }
-
+    println("Data saved successfully")
     spark.stop()
   }
 }
