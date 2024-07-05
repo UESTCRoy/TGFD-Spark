@@ -3,13 +3,13 @@ package tgfdDiscovery.script.dbpedia
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.log4j.{Level, Logger}
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.graphx.{Edge, Graph, VertexId}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import tgfdDiscovery.common.VertexData
 import tgfdDiscovery.script.dbpedia.DBPediaGraphUtils.{createDBPediaEdges, createDBPediaVertices}
 
-import java.io.FileOutputStream
 import scala.util.matching.Regex
 
 object CustomDBPediaGraph {
@@ -78,46 +78,50 @@ object CustomDBPediaGraph {
         }
       }
 
-      val vertices: RDD[(VertexId, VertexData)] = createDBPediaVertices(parsedTriplets)
-      val edges: RDD[Edge[String]] = createDBPediaEdges(parsedTriplets)
-      edges.cache()
+      val rawVertices: RDD[(VertexId, VertexData)] = createDBPediaVertices(parsedTriplets)
+      val rawEdges: RDD[Edge[String]] = createDBPediaEdges(parsedTriplets)
+      val rawGraph = Graph(rawVertices, rawEdges)
+      println(s"Number of Raw Vertices: ${rawGraph.vertices.count()}, Number of Raw Edges: ${rawGraph.edges.count()}")
+
+      // Calculate in-degrees and out-degrees
+      val degrees = rawGraph.degrees.cache()
+
+      val highDegreeVertices = degrees.filter { case (_, degree) => degree > 500 }
+      val validVertexIds = highDegreeVertices.keys.collect().toSet
+
+      val filteredVertices = rawVertices.filter { case (id, _) => !validVertexIds.contains(id) }
+      val filteredEdges = rawEdges.filter(e => validVertexIds.contains(e.srcId) && validVertexIds.contains(e.dstId))
+
+      val filteredGraph = Graph(filteredVertices, filteredEdges)
+      println(s"Number of Filtered Vertices: ${filteredGraph.vertices.count()}, Number of Filtered Edges: ${filteredGraph.edges.count()}")
 
       val selectedEdgesRDD = if (previousSelectedEdges.isEmpty) {
         // 从筛选后的边中随机选择
-        val initialSelectedEdgesArray = edges.takeSample(withReplacement = false, edgeSize.toInt)
+        val initialSelectedEdgesArray = filteredEdges.takeSample(withReplacement = false, edgeSize.toInt)
 
         spark.sparkContext.parallelize(initialSelectedEdgesArray)
       } else {
         // 后续图：尽量保留之前选定的边
-        selectEdgesToKeep(edges, previousSelectedEdges, edgeSize.toInt)
+        selectEdgesToKeep(filteredEdges, previousSelectedEdges, edgeSize.toInt)
       }
       // Update previousSelectedEdges with the latest selected edges
       previousSelectedEdges = selectedEdgesRDD
 
       // 创建新图，仅包含选定的边和相关联的顶点
-      val edgeVertices = selectedEdgesRDD
+      val selectedEdgeVertices = selectedEdgesRDD
         .flatMap(e => Iterator(e.srcId, e.dstId))
         .distinct()
         .map(id => (id, ()))
 
-      val filteredVertices = vertices
-        .join(edgeVertices)
+      val selectedVertices = filteredVertices
+        .join(selectedEdgeVertices)
         .mapValues(_._1)
 
-      val graph = Graph(filteredVertices, selectedEdgesRDD)
-      val nonNullVertices = graph.vertices.filter { case (_, vertexData) => vertexData != null && vertexData.vertexType != null }
-      val nonNullEdges = graph.edges.filter { case Edge(srcId, dstId, attr) => attr != null }
+      val nonNullVertices = selectedVertices.filter { case (_, vertexData) => vertexData != null && vertexData.vertexType != null }
+      val nonNullEdges = selectedEdgesRDD.filter { case Edge(srcId, dstId, attr) => attr != null }
 
-      println(s"Number of Valid vertices: ${graph.vertices.count()}, Number of Valid edges: ${graph.edges.count()}")
-
-      val vertexInDegrees = nonNullEdges.map(e => (e.dstId, 1)).reduceByKey(_ + _)
-      val invalidVertexIds = vertexInDegrees.filter { case (vertexId, count) => count > 100 }.keys.collect().toSet
-      // 删除与入度超过100的顶点相关的边
-      val validEdges = nonNullEdges.filter(e => !invalidVertexIds.contains(e.srcId) && !invalidVertexIds.contains(e.dstId))
-
-      val validVertices = nonNullVertices.filter { case (vertexId, _) => !invalidVertexIds.contains(vertexId) }
-      val newGraph = Graph(validVertices, validEdges)
-      println(s"Number of filter vertices: ${newGraph.vertices.count()}, Number of filter edges: ${newGraph.edges.count()}")
+      val customGraph = Graph(nonNullVertices, nonNullEdges)
+      println(s"Number of Custom vertices: ${customGraph.vertices.count()}, Number of Custom edges: ${customGraph.edges.count()}")
 
       val vertexTypeCount = nonNullVertices.map(_._2.vertexType).countByValue()
 
@@ -127,7 +131,7 @@ object CustomDBPediaGraph {
       }
 
       // Count predicates
-      val predicateCounts = countPredicates(newGraph.edges)
+      val predicateCounts = countPredicates(customGraph.edges)
 
       // Log predicate counts
       predicateCounts.collect().foreach { case (predicate, count) =>
@@ -136,7 +140,7 @@ object CustomDBPediaGraph {
 
       val outputFilePath = new Path(outputDir, fileName).toString
 
-      val vertexLines = validVertices.map { case (_, vertexData: VertexData) =>
+      val vertexLines = nonNullVertices.map { case (_, vertexData: VertexData) =>
         if (vertexData != null && vertexData.vertexType != null && vertexData.uri != null) {
           val uri = s"<http://dbpedia.org/${vertexData.vertexType}/${vertexData.uri}>"
           vertexData.attributes.toSeq.flatMap { case (attrName, attrValue) =>
@@ -158,10 +162,10 @@ object CustomDBPediaGraph {
       }.filter(_.nonEmpty)
 
       // 创建映射边到它们的源顶点和目标顶点
-      val vertexRdd = newGraph.vertices
+      val vertexRdd = customGraph.vertices
 
       // 将边与其源顶点和目标顶点的数据进行连接
-      val edgesWithVertices = newGraph.edges
+      val edgesWithVertices = customGraph.edges
         .map(e => (e.srcId, e))
         .join(vertexRdd)
         .map { case (_, (edge, srcVertexData)) => (edge.dstId, (edge, srcVertexData)) }
