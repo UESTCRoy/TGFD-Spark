@@ -3,7 +3,6 @@ package tgfdDiscovery.script.dbpedia
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.log4j.{Level, Logger}
-import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.graphx.{Edge, Graph, VertexId}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
@@ -87,9 +86,10 @@ object CustomDBPediaGraph {
       val degrees = rawGraph.degrees.cache()
 
       val highDegreeVertices = degrees.filter { case (_, degree) => degree > 500 }
-      val validVertexIds = highDegreeVertices.keys.collect().toSet
+      val invalidVertexIds = highDegreeVertices.keys.collect().toSet
 
-      val filteredVertices = rawVertices.filter { case (id, _) => !validVertexIds.contains(id) }
+      val filteredVertices = rawVertices.filter { case (id, _) => !invalidVertexIds.contains(id) }
+      val validVertexIds = filteredVertices.keys.collect().toSet
       val filteredEdges = rawEdges.filter(e => validVertexIds.contains(e.srcId) && validVertexIds.contains(e.dstId))
 
       val filteredGraph = Graph(filteredVertices, filteredEdges)
@@ -117,13 +117,11 @@ object CustomDBPediaGraph {
         .join(selectedEdgeVertices)
         .mapValues(_._1)
 
-      val nonNullVertices = selectedVertices.filter { case (_, vertexData) => vertexData != null && vertexData.vertexType != null }
-      val nonNullEdges = selectedEdgesRDD.filter { case Edge(srcId, dstId, attr) => attr != null }
-
-      val customGraph = Graph(nonNullVertices, nonNullEdges)
+      val customGraph = Graph(selectedVertices, selectedEdgesRDD)
+      println(s"Number of Raw Custom vertices: ${selectedVertices.count()}, Number of Raw Custom edges: ${selectedEdgesRDD.count()}")
       println(s"Number of Custom vertices: ${customGraph.vertices.count()}, Number of Custom edges: ${customGraph.edges.count()}")
 
-      val vertexTypeCount = nonNullVertices.map(_._2.vertexType).countByValue()
+      val vertexTypeCount = selectedVertices.map(_._2.vertexType).countByValue()
 
       // Logging the results
       vertexTypeCount.foreach { case (vertexType, count) =>
@@ -140,7 +138,7 @@ object CustomDBPediaGraph {
 
       val outputFilePath = new Path(outputDir, fileName).toString
 
-      val vertexLines = nonNullVertices.map { case (_, vertexData: VertexData) =>
+      val vertexLines = selectedVertices.map { case (_, vertexData: VertexData) =>
         if (vertexData != null && vertexData.vertexType != null && vertexData.uri != null) {
           val uri = s"<http://dbpedia.org/${vertexData.vertexType}/${vertexData.uri}>"
           vertexData.attributes.toSeq.flatMap { case (attrName, attrValue) =>
@@ -161,15 +159,12 @@ object CustomDBPediaGraph {
         } else ""
       }.filter(_.nonEmpty)
 
-      // 创建映射边到它们的源顶点和目标顶点
-      val vertexRdd = customGraph.vertices
-
       // 将边与其源顶点和目标顶点的数据进行连接
-      val edgesWithVertices = customGraph.edges
+      val edgesWithVertices = selectedEdgesRDD
         .map(e => (e.srcId, e))
-        .join(vertexRdd)
+        .join(selectedVertices)
         .map { case (_, (edge, srcVertexData)) => (edge.dstId, (edge, srcVertexData)) }
-        .join(vertexRdd)
+        .join(selectedVertices)
         .map { case (_, ((edge, srcVertexData), dstVertexData)) => (edge, srcVertexData, dstVertexData) }
 
       val edgeLines = edgesWithVertices.flatMap { case (edge, srcVertexData, dstVertexData) =>
