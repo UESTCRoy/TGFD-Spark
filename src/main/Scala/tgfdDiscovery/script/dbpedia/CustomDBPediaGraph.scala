@@ -22,8 +22,8 @@ object CustomDBPediaGraph {
   val attributeRegex: Regex = "/([^/>]+)>$".r
 
   def main(args: Array[String]): Unit = {
-    if (args.length < 3) {
-      logger.error("Usage: IMDBLoader <input_directory> <output_directory>")
+    if (args.length < 4) {
+      logger.error("Usage: DBPediaLoader <input_directory> <output_directory>")
       System.exit(1)
     }
 
@@ -37,16 +37,7 @@ object CustomDBPediaGraph {
     val inputDir = args(0)
     val outputDir = args(1)
     val edgeSize = args(2)
-
-//    val spark = SparkSession
-//      .builder
-//      .appName("RDF Graph Loader")
-//      .master("local[*]")
-//      .getOrCreate()
-//
-//    val inputDir = "/Users/roy/Desktop/TGFD/datasets/dbpedia/dbpedia-test"
-//    val outputDir = "/Users/roy/Desktop/TGFD/test"
-//    val edgeSize = 1000000
+    val filterDegree = args(3).toInt
 
     val conf = new Configuration()
     val fs = FileSystem.get(new java.net.URI(inputDir), conf)
@@ -84,25 +75,53 @@ object CustomDBPediaGraph {
 
       // Calculate in-degrees and out-degrees
       val degrees = rawGraph.degrees.cache()
-
-      val highDegreeVertices = degrees.filter { case (_, degree) => degree > 500 }
+      val highDegreeVertices = degrees.filter { case (_, degree) => degree > filterDegree }
       val invalidVertexIds = highDegreeVertices.keys.collect().toSet
+      println(s"Number of High Degree Vertices: ${invalidVertexIds.size}")
 
-      val filteredVertices = rawVertices.filter { case (id, _) => !invalidVertexIds.contains(id) }
-      val validVertexIds = filteredVertices.keys.collect().toSet
-      val filteredEdges = rawEdges.filter(e => validVertexIds.contains(e.srcId) && validVertexIds.contains(e.dstId))
+      // Create Non Null Graph
+      val vertexIdsFromEdges: RDD[(VertexId, Unit)] = rawEdges
+        .flatMap(edge => Iterator((edge.srcId, ()), (edge.dstId, ())))
+        .distinct()
 
-      val filteredGraph = Graph(filteredVertices, filteredEdges)
-      println(s"Number of Filtered Vertices: ${filteredGraph.vertices.count()}, Number of Filtered Edges: ${filteredGraph.edges.count()}")
+      val connectedVertices: RDD[(VertexId, VertexData)] = rawVertices
+        .join(vertexIdsFromEdges)
+        .map {
+          case (id, (vertexData, _)) => (id, vertexData)
+        }
+        .filter { case (id, _) => !invalidVertexIds.contains(id) }
+
+      val connectedVertexIds = connectedVertices.keys.collect().toSet
+      println(s"Number of Low Degree Connected Vertex Ids: ${connectedVertexIds.size}")
+      val bcConnectedVertexIds = spark.sparkContext.broadcast(connectedVertexIds)
+
+      val connectedEdges = rawEdges.filter(edge =>
+        bcConnectedVertexIds.value.contains(edge.srcId) && bcConnectedVertexIds.value.contains(edge.dstId))
+
+      val connectedGraph = Graph(connectedVertices, connectedEdges)
+      println(s"Number of Connected Vertices: ${connectedGraph.vertices.count()}, Number of Connected Edges: ${connectedGraph.edges.count()}")
+
+      // Calculate in-degrees and out-degrees
+//      val degrees = rawGraph.degrees.cache()
+//
+//      val highDegreeVertices = degrees.filter { case (_, degree) => degree > filterDegree }
+//      val invalidVertexIds = highDegreeVertices.keys.collect().toSet
+//
+//      val filteredVertices = rawVertices.filter { case (id, _) => !invalidVertexIds.contains(id) }
+//      val validVertexIds = filteredVertices.keys.collect().toSet
+//      val filteredEdges = rawEdges.filter(e => validVertexIds.contains(e.srcId) && validVertexIds.contains(e.dstId))
+//
+//      val filteredGraph = Graph(filteredVertices, filteredEdges)
+//      println(s"Number of Filtered Vertices: ${filteredGraph.vertices.count()}, Number of Filtered Edges: ${filteredGraph.edges.count()}")
 
       val selectedEdgesRDD = if (previousSelectedEdges.isEmpty) {
         // 从筛选后的边中随机选择
-        val initialSelectedEdgesArray = filteredEdges.takeSample(withReplacement = false, edgeSize.toInt)
+        val initialSelectedEdgesArray = connectedEdges.takeSample(withReplacement = false, edgeSize.toInt)
 
         spark.sparkContext.parallelize(initialSelectedEdgesArray)
       } else {
         // 后续图：尽量保留之前选定的边
-        selectEdgesToKeep(filteredEdges, previousSelectedEdges, edgeSize.toInt)
+        selectEdgesToKeep(connectedEdges, previousSelectedEdges, edgeSize.toInt)
       }
       // Update previousSelectedEdges with the latest selected edges
       previousSelectedEdges = selectedEdgesRDD
@@ -113,7 +132,7 @@ object CustomDBPediaGraph {
         .distinct()
         .map(id => (id, ()))
 
-      val selectedVertices = filteredVertices
+      val selectedVertices = connectedVertices
         .join(selectedEdgeVertices)
         .mapValues(_._1)
 
@@ -123,17 +142,22 @@ object CustomDBPediaGraph {
 
       val vertexTypeCount = selectedVertices.map(_._2.vertexType).countByValue()
 
-      // Logging the results
-      vertexTypeCount.foreach { case (vertexType, count) =>
-        println(s"Vertex Type: $vertexType, Count: $count")
+      // Convert the Map to a Seq and sort by count
+      val sortedVertexTypeCount = vertexTypeCount.toSeq.sortBy(-_._2)  // Negative sign for descending order
+
+      // Print the sorted results
+      sortedVertexTypeCount.foreach { case (vertexType, count) =>
+//        println(s"Vertex Type: $vertexType, Count: $count")
       }
 
-      // Count predicates
       val predicateCounts = countPredicates(customGraph.edges)
 
-      // Log predicate counts
-      predicateCounts.collect().foreach { case (predicate, count) =>
-        println(s"Predicate: $predicate, Count: $count")
+      // Sort by count in descending order and collect to the driver
+      val sortedPredicateCounts = predicateCounts.sortBy(_._2, ascending = false).collect()
+
+      // Print the sorted results
+      sortedPredicateCounts.foreach { case (predicate, count) =>
+//        println(s"Predicate: $predicate, Count: $count")
       }
 
       val outputFilePath = new Path(outputDir, fileName).toString
