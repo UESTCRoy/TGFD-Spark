@@ -3,7 +3,7 @@ package tgfdDiscovery.script.dbpedia
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.log4j.{Level, Logger}
-import org.apache.spark.graphx.{Edge, Graph, VertexId}
+import org.apache.spark.graphx.{Edge, Graph, PartitionStrategy, VertexId}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import tgfdDiscovery.common.VertexData
@@ -72,36 +72,33 @@ object DBPediaPartitionByEdge {
       val edges: RDD[Edge[String]] = createDBPediaEdges(parsedTriplets)
       val graph = Graph(vertices, edges)
 
-      val initialEdgePredCounts = graph.edges
-        .map(_.attr)
-        .distinct()
-        .collect()
-        .map(pred => (pred, Array.fill(numPartitions)(0)))
-        .toMap
+      val partitionedGraph = graph.partitionBy(PartitionStrategy.EdgePartition2D, numPartitions)
 
-      val edgePredCounts = mutable.Map(initialEdgePredCounts.toSeq: _*)
-
-      val edgesWithPartition = graph.edges.map { edge =>
-        val partitionId = assignEdgePartition(edge.attr, numPartitions, edgePredCounts)
-        (edge, partitionId)
+      val edgesByPartition = partitionedGraph.edges.mapPartitionsWithIndex { (index, iter) =>
+        iter.map { edge => (index, edge) }
       }
 
       for (partitionId <- 0 until numPartitions) {
-        // 过滤属于当前分区的边
-        val edgesInPartition = edgesWithPartition.filter(_._2 == partitionId).map(_._1)
+        val currentPartitionEdges: RDD[Edge[String]] = edgesByPartition
+          .filter(_._1 == partitionId)
+          .map(_._2)
 
-        // 获取当前分区内的顶点ID
-        val vertexIdsInPartition = edgesInPartition.flatMap(edge => Seq(edge.srcId, edge.dstId)).distinct()
+        // 从 currentPartitionEdges 提取所有顶点ID
+        val vertexIdsInCurrentPartition = currentPartitionEdges
+          .flatMap(edge => Iterator(edge.srcId, edge.dstId))
+          .distinct()
+          .map(id => (id, ()))
 
-        // 通过 join 获取顶点数据
-        val verticesInPartition = vertexIdsInPartition
-          .map(id => (id, id))
-          .join(graph.vertices)
-          .map { case (_, (id, data)) => (id, data) }
+        // 获取这些顶点ID对应的顶点数据
+        val vertexDataInCurrentPartition: RDD[(VertexId, VertexData)] = vertices
+          .join(vertexIdsInCurrentPartition)
+          .map { case (id, (vertexData, _)) => (id, vertexData) }
 
-        val subGraph = Graph(verticesInPartition, edgesInPartition)
+        // 构建子图
+        val subGraph = Graph(vertexDataInCurrentPartition, currentPartitionEdges)
 
         println(s"Processing $fileName, partition $partitionId")
+        println(s"Number of Raw vertices: ${vertexDataInCurrentPartition.count()}, Number of Raw edges: ${currentPartitionEdges.count()}")
         println(s"Number of vertices: ${subGraph.vertices.count()}, Number of edges: ${subGraph.edges.count()}")
 
         // 保存子图
@@ -118,7 +115,7 @@ object DBPediaPartitionByEdge {
 
         val outputFilePath = new Path(outputDir, subGraphFileName).toString
 
-        val vertexLines = verticesInPartition.map { case (vertexId, vertexData) =>
+        val vertexLines = subGraph.vertices.map { case (vertexId, vertexData) =>
           if (vertexData != null && vertexData.vertexType != null && vertexData.uri != null) {
             val uri = s"<http://dbpedia.org/${vertexData.vertexType}/${vertexData.uri}>"
             vertexData.attributes.toSeq.flatMap { case (attrName, attrValue) =>
@@ -143,7 +140,7 @@ object DBPediaPartitionByEdge {
         val vertexRdd = subGraph.vertices
 
         // 将边与其源顶点和目标顶点的数据进行连接
-        val edgesWithVertices = edgesInPartition
+        val edgesWithVertices = subGraph.edges
           .map(e => (e.srcId, e))
           .join(vertexRdd)
           .map { case (_, (edge, srcVertexData)) => (edge.dstId, (edge, srcVertexData)) }
